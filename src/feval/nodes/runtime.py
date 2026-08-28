@@ -21,13 +21,12 @@ from ..chain import (
     finalized_block,
     publish_model_commitment,
     read_model_commitments,
-    scan_model_commitment_history,
     set_weight_mapping,
     wallet_hotkey_ss58,
 )
 from ..chain.champions import champion_weight_mapping, encode_reward_bits, update_champions
 from ..core.config import NetworkConfig, load_network_config
-from ..core.constants import HISTORY_LOOKBACK_BLOCKS, PROTOCOL_MINER_ROLLOUT_STATE, PROTOCOL_VALIDATOR_STATE
+from ..core.constants import PROTOCOL_MINER_ROLLOUT_STATE, PROTOCOL_VALIDATOR_STATE
 from ..datasets.dataset import prepare_candidate_pool_from_config, prepare_window_from_pool
 from ..models.hub import (
     resolve_rollout_revision,
@@ -62,8 +61,25 @@ from ..utils.ui import print_rows_table
 PENDING_AUDIT_POLL_SECONDS = 30
 
 
+class DuplicateRolloutError(ValueError):
+    def __init__(self, earlier_hotkey: str, rows_sha256: str):
+        self.earlier_hotkey = earlier_hotkey
+        self.rows_sha256 = rows_sha256
+        super().__init__(
+            f"identical greedy rollouts were committed first by {earlier_hotkey}"
+        )
+
+
 def _short_hotkey(value: str) -> str:
     return value if len(value) <= 20 else f"{value[:8]}...{value[-6:]}"
+
+
+def _validator_progress(status: str, **fields: Any) -> None:
+    print(
+        json.dumps({"status": status, **fields}, sort_keys=True),
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _print_round_results(*, window: int, block: int, rows: list[dict[str, Any]]) -> None:
@@ -126,9 +142,7 @@ def _initial_state() -> dict[str, Any]:
         "pending": {},
         "results": {},
         "audited": {},
-        "first_seen": {},
-        "rollout_first_seen": {},
-        "history_cursor": None,
+        "rollout_priority": {},
         "champions": [],
         "carryover_results": {},
         "last_promotion_decision": None,
@@ -165,6 +179,7 @@ def _normalize_state(state: Any) -> dict[str, Any]:
         "feval-validator-state-v23",
         "feval-validator-state-v24",
         "feval-validator-state-v25",
+        "feval-validator-state-v26",
     }:
         # Audit semantics changed. Never carry old pass/fail decisions or
         # partial rounds into a different token-validity protocol.
@@ -174,14 +189,15 @@ def _normalize_state(state: Any) -> dict[str, Any]:
         state["pending"] = {}
         state["results"] = {}
         state["audited"] = {}
-        state["first_seen"] = {}
-        state["rollout_first_seen"] = {}
-        state["history_cursor"] = None
+        state["rollout_priority"] = {}
         state["champions"] = []
         state["carryover_results"] = {}
         state["last_promotion_decision"] = None
         state["invalid_strikes"] = {}
         state["blacklist"] = {}
+        state.pop("first_seen", None)
+        state.pop("rollout_first_seen", None)
+        state.pop("history_cursor", None)
         state.pop("last_weights", None)
     if state.get("protocol") != PROTOCOL_VALIDATOR_STATE:
         raise ValueError("validator state has an unsupported protocol")
@@ -191,8 +207,7 @@ def _normalize_state(state: Any) -> dict[str, Any]:
         "pending",
         "results",
         "audited",
-        "first_seen",
-        "rollout_first_seen",
+        "rollout_priority",
         "carryover_results",
         "invalid_strikes",
         "blacklist",
@@ -203,7 +218,7 @@ def _normalize_state(state: Any) -> dict[str, Any]:
         raise ValueError("validator state champions must be a list")
     if isinstance(state["round"], bool) or not isinstance(state["round"], int) or state["round"] < 0:
         raise ValueError("validator state round is invalid")
-    for name in ("window", "last_weight_block", "history_cursor"):
+    for name in ("window", "last_weight_block"):
         value = state[name]
         if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
             raise ValueError(f"validator state field {name} is invalid")
@@ -289,6 +304,8 @@ def _active_blacklist(
 def _counts_as_invalid_strike(exc: ValueError) -> bool:
     """Lifecycle races are not miner-integrity failures."""
 
+    if isinstance(exc, DuplicateRolloutError):
+        return False
     return str(exc) not in {
         "miner commitment disappeared",
         "miner changed its model commitment before audit",
@@ -647,25 +664,20 @@ def _current_commitments(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _copy_filtered(
     rows: list[dict[str, Any]],
-    state: dict[str, Any],
-    *,
-    minimum_block: int = 0,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
-    first_seen = state.setdefault("first_seen", {})
-    for digest, entry in list(first_seen.items()):
-        if not isinstance(entry, dict) or int(entry.get("block", -1)) < minimum_block:
-            first_seen.pop(digest, None)
-    recent_rows = [row for row in rows if int(row["commit_block"]) >= minimum_block]
-    for row in sorted(recent_rows, key=lambda item: (item["commit_block"], item["hotkey"])):
+    """Keep the earliest current commitment for each exact model digest."""
+
+    priority: dict[str, dict[str, Any]] = {}
+    for row in sorted(rows, key=lambda item: (item["commit_block"], item["hotkey"])):
         digest = row["commitment"].model_digest
-        existing = first_seen.get(digest)
-        candidate = {"hotkey": row["hotkey"], "block": row["commit_block"]}
-        if existing is None or (candidate["block"], candidate["hotkey"]) < (existing["block"], existing["hotkey"]):
-            first_seen[digest] = candidate
+        priority.setdefault(
+            digest,
+            {"hotkey": row["hotkey"], "block": int(row["commit_block"])},
+        )
     eligible: list[dict[str, Any]] = []
     copies: dict[str, str] = {}
-    for row in recent_rows:
-        first_miner = first_seen[row["commitment"].model_digest]["hotkey"]
+    for row in rows:
+        first_miner = priority[row["commitment"].model_digest]["hotkey"]
         if row["hotkey"] == first_miner:
             eligible.append(row)
         else:
@@ -673,7 +685,7 @@ def _copy_filtered(
     return eligible, copies
 
 
-def _record_rollout_fingerprint(
+def _record_rollout_priority(
     state: dict[str, Any],
     *,
     hotkey: str,
@@ -681,9 +693,9 @@ def _record_rollout_fingerprint(
     window: int,
     rows_sha256: str,
 ) -> tuple[str | None, str | None]:
-    """Return (copy owner, displaced later owner) for exact greedy behavior."""
+    """Return the earlier current submitter for identical rollout bytes."""
 
-    fingerprints = state.setdefault("rollout_first_seen", {})
+    fingerprints = state.setdefault("rollout_priority", {})
     key = f"{window}:{rows_sha256}"
     candidate = {"hotkey": hotkey, "block": int(commit_block)}
     existing = fingerprints.get(key)
@@ -694,8 +706,8 @@ def _record_rollout_fingerprint(
         displaced = str(existing["hotkey"]) if isinstance(existing, dict) else None
         fingerprints[key] = candidate
         return None, displaced
-    owner = str(existing["hotkey"])
-    return (None, None) if owner == hotkey else (owner, None)
+    earlier_hotkey = str(existing["hotkey"])
+    return (None, None) if earlier_hotkey == hotkey else (earlier_hotkey, None)
 
 
 def _manifest_matches(
@@ -856,7 +868,7 @@ class ValidatorRunner:
         poll_seconds: int | None = None,
     ) -> None:
         # Protocol rules are code-pinned. Each validator independently derives
-        # evaluation data and reconstructs commitment history from the chain.
+        # evaluation data and reads current registered-miner commitments.
         self.config = load_network_config(config_path, production=False)
         self.wallet = wallet
         self.hotkey = hotkey
@@ -1005,9 +1017,9 @@ class ValidatorRunner:
         self.state["pending"] = {}
         self.state["results"] = {}
         self.state["audited"] = {}
-        self.state["rollout_first_seen"] = {
+        self.state["rollout_priority"] = {
             key: value
-            for key, value in self.state.get("rollout_first_seen", {}).items()
+            for key, value in self.state.get("rollout_priority", {}).items()
             if str(key).startswith(f"{window}:")
         }
 
@@ -1084,7 +1096,7 @@ class ValidatorRunner:
                         window=window,
                         eval_manifest=eval_manifest,
                     )
-                    copy_owner, displaced = _record_rollout_fingerprint(
+                    earlier_hotkey, displaced = _record_rollout_priority(
                         self.state,
                         hotkey=hotkey,
                         commit_block=int(current["commit_block"]),
@@ -1099,12 +1111,13 @@ class ValidatorRunner:
                             "valid": False,
                             "score": 0.0,
                             "audit_status": "copied",
+                            "copy_kind": "rollout",
+                            "copy_source": hotkey,
+                            "rollout_rows_sha256": manifest.rows_sha256,
                             "error": f"identical greedy rollouts were committed first by {hotkey}",
                         }
-                    if copy_owner is not None:
-                        raise ValueError(
-                            f"identical greedy rollouts were committed first by {copy_owner}"
-                        )
+                    if earlier_hotkey is not None:
+                        raise DuplicateRolloutError(earlier_hotkey, manifest.rows_sha256)
                     score, scored = score_rollouts(
                         eval_rows,
                         rollout_rows,
@@ -1116,11 +1129,11 @@ class ValidatorRunner:
                     round_correct = sum(int(row["reward"]) for row in scored)
                     round_row_count = len(scored)
                     timings["local_validation_score"] = round(time.monotonic() - stage_started, 3)
-                    history_key = (
+                    audit_key = (
                         f"{hotkey}:{commitment.model_digest}:{rollout_revision}:{window}"
                     )
                     progress = self.state["audited"].setdefault(
-                        history_key,
+                        audit_key,
                         {
                             "rows": [],
                             "rounds_passed": 0,
@@ -1135,8 +1148,8 @@ class ValidatorRunner:
                             "exact_argmax_tokens": 0,
                             "tokens_checked": 0,
                         }
-                        self.state["audited"][history_key] = progress
-                    history = progress.setdefault("rows", [])
+                        self.state["audited"][audit_key] = progress
+                    audited_rows = progress.setdefault("rows", [])
                     seed = audit_seed(
                         netuid=self.config.netuid,
                         block_hash=block_hash(network=self.network, block=int(pending["challenge_block"])),
@@ -1149,7 +1162,7 @@ class ValidatorRunner:
                         scored,
                         seed=seed,
                         count=self.config.audit_rows_per_round,
-                        already_audited=history,
+                        already_audited=audited_rows,
                     )
                     if not selected_ids:
                         raise ValueError("no unaudited rollout rows remain")
@@ -1194,7 +1207,7 @@ class ValidatorRunner:
                         min_exact_argmax_ratio=self.config.audit_min_exact_argmax_ratio,
                     )
                 timings["total"] = round(time.monotonic() - audit_started, 3)
-                history.extend(selected_ids)
+                audited_rows.extend(selected_ids)
                 progress["exact_argmax_tokens"] = int(progress.get("exact_argmax_tokens", 0)) + exact_tokens
                 progress["tokens_checked"] = int(progress.get("tokens_checked", 0)) + tokens_checked
                 if audit_valid:
@@ -1272,7 +1285,7 @@ class ValidatorRunner:
                     "model_revision": commitment.model_revision,
                     "commit_block": current["commit_block"],
                     "rollout_revision": rollout_revision,
-                    "audited_rows": list(history),
+                    "audited_rows": list(audited_rows),
                     "audit_round": rounds_passed,
                     "audit_required_rounds": required_rounds,
                     "audit_total_rounds": total_rounds,
@@ -1344,7 +1357,18 @@ class ValidatorRunner:
                     "score": 0.0,
                     "model_digest": pending["commitment"].get("h"),
                     "rollout_revision": pending.get("rollout_revision"),
-                    "audit_status": "blacklisted" if blacklisted is not None else "failed",
+                    "audit_status": (
+                        "blacklisted"
+                        if blacklisted is not None
+                        else ("copied" if isinstance(exc, DuplicateRolloutError) else "failed")
+                    ),
+                    "copy_kind": "rollout" if isinstance(exc, DuplicateRolloutError) else None,
+                    "copy_source": (
+                        exc.earlier_hotkey if isinstance(exc, DuplicateRolloutError) else None
+                    ),
+                    "rollout_rows_sha256": (
+                        exc.rows_sha256 if isinstance(exc, DuplicateRolloutError) else None
+                    ),
                     "audit_timings_seconds": timings,
                     "blacklisted_until_block": (
                         int(blacklisted["until_block"]) if blacklisted is not None else None
@@ -1365,7 +1389,11 @@ class ValidatorRunner:
                         "round": str(round_index),
                         "audit_rows": "-",
                         "exact": "-",
-                        "outcome": "BLACKLISTED" if blacklisted is not None else "INVALID",
+                        "outcome": (
+                            "BLACKLISTED"
+                            if blacklisted is not None
+                            else ("COPY" if isinstance(exc, DuplicateRolloutError) else "INVALID")
+                        ),
                         "seconds": f"{timings['total']:.2f}s",
                         "error": self.state["results"][hotkey]["error"],
                     }
@@ -1482,13 +1510,13 @@ class ValidatorRunner:
                 and previous.get("model_digest") == commitment.model_digest
                 and previous.get("rollout_revision") == revision
                 and (
-                    previous_status == "failed"
+                    previous_status in {"failed", "copied"}
                     or (previous_status == "passed" and previous_round >= total_rounds)
                 )
             ):
                 continue
-            history_key = f"{hotkey}:{commitment.model_digest}:{revision}:{self.state.get('window')}"
-            progress = self.state["audited"].get(history_key, {})
+            audit_key = f"{hotkey}:{commitment.model_digest}:{revision}:{self.state.get('window')}"
+            progress = self.state["audited"].get(audit_key, {})
             next_round = int(progress.get("rounds_passed", 0)) + 1 if isinstance(progress, dict) else 1
             if not (
                 isinstance(previous, dict)
@@ -1609,70 +1637,20 @@ class ValidatorRunner:
             self._close_wandb_run()
             return {"status": "unavailable", "error": f"{type(exc).__name__}: {exc}"}
 
-    def _sync_history(self, *, current_block: int) -> tuple[int, bool]:
-        start_block = max(0, current_block - HISTORY_LOOKBACK_BLOCKS + 1)
-        cursor_value = self.state.get("history_cursor")
-        cursor = start_block - 1 if cursor_value is None else int(cursor_value)
-        if cursor < start_block - 1:
-            # The rolling seven-day window advanced beyond the saved cursor.
-            # Rebuild recent priority rather than retaining stale identities.
-            self.state["first_seen"] = {}
-            cursor = start_block - 1
-        _copy_filtered([], self.state, minimum_block=start_block)
-        for key, entry in list(self.state.setdefault("rollout_first_seen", {}).items()):
-            if not isinstance(entry, dict) or int(entry.get("block", -1)) < start_block:
-                self.state["rollout_first_seen"].pop(key, None)
-        if cursor > current_block:
-            raise ValueError("validator history cursor is ahead of the finalized chain")
-        if cursor == current_block:
-            return 0, True
-        end = min(current_block, cursor + self.config.history_batch_blocks)
-        rows = scan_model_commitment_history(
-            netuid=self.config.netuid,
-            network=self.network,
-            start_block=cursor + 1,
-            end_block=end,
-        )
-        _copy_filtered(rows, self.state, minimum_block=start_block)
-        self.state["history_cursor"] = end
-        return len(rows), end == current_block
-
-    def sync_history_once(self) -> dict[str, Any]:
-        current_block = finalized_block(network=self.network)
-        records, ready = self._sync_history(current_block=current_block)
-        _atomic_write_json(self.state_path, self.state)
-        return {
-            "status": "ready" if ready else "syncing_history",
-            "history_cursor": self.state["history_cursor"],
-            "history_target": current_block,
-            "history_records": records,
-            "ready": ready,
-        }
-
     def cycle(self) -> dict[str, Any]:
         scratch_cleaned = _clear_audit_scratch(self.work_dir)
+        _validator_progress("reading_finalized_chain")
         current_block = finalized_block(network=self.network)
-        history_rows, history_ready = self._sync_history(current_block=current_block)
-        if not history_ready:
-            _atomic_write_json(self.state_path, self.state)
-            return {
-                "block": current_block,
-                "status": "syncing_history",
-                "history_cursor": self.state["history_cursor"],
-                "history_target": current_block,
-                "history_records": history_rows,
-                "scratch_cleaned": scratch_cleaned,
-                "weights_submitted": False,
-            }
         window = dataset_window(current_block, self.config.dataset_window_blocks)
         if self.state.get("window") != window:
             self._reset_window(window)
+        _validator_progress("preparing_evaluation", block=current_block, window=window)
         eval_path, _, eval_manifest = ensure_evaluation_files(
             self.config,
             window=window,
             directory=self.work_dir / "evaluation",
         )
-        history_cutoff = max(0, current_block - HISTORY_LOOKBACK_BLOCKS + 1)
+        _validator_progress("reading_current_commitments", block=current_block)
         rows = _current_commitments(
             [
                 row
@@ -1681,20 +1659,47 @@ class ValidatorRunner:
                     network=self.network,
                     block=current_block,
                 )
-                if row.get("uid") is not None and int(row["commit_block"]) >= history_cutoff
+                if row.get("uid") is not None
             ]
         )
-        eligible, copies = _copy_filtered(
-            rows,
-            self.state,
-            minimum_block=history_cutoff,
-        )
+        _validator_progress("current_commitments_ready", miners=len(rows))
+        eligible, copies = _copy_filtered(rows)
         current = {row["hotkey"]: row for row in rows}
+        self.state["rollout_priority"] = {
+            key: entry
+            for key, entry in self.state.get("rollout_priority", {}).items()
+            if (
+                str(key).startswith(f"{window}:")
+                and isinstance(entry, dict)
+                and str(entry.get("hotkey")) in current
+                and int(entry.get("block", -1))
+                == int(current[str(entry["hotkey"])]["commit_block"])
+            )
+        }
+        for hotkey, result in list(self.state["results"].items()):
+            if not isinstance(result, dict) or result.get("audit_status") != "copied":
+                continue
+            copy_kind = result.get("copy_kind")
+            active_copy = hotkey in copies if copy_kind == "model" else False
+            if copy_kind == "rollout":
+                fingerprint = f"{window}:{result.get('rollout_rows_sha256')}"
+                entry = self.state["rollout_priority"].get(fingerprint)
+                active_copy = bool(
+                    isinstance(entry, dict)
+                    and str(entry.get("hotkey")) != hotkey
+                    and str(entry.get("hotkey")) in current
+                )
+            if not active_copy:
+                self.state["results"].pop(hotkey, None)
+                self.state["pending"].pop(hotkey, None)
         for hotkey, first_miner in copies.items():
             self.state["results"][hotkey] = {
                 "uid": current.get(hotkey, {}).get("uid"),
                 "valid": False,
                 "score": 0.0,
+                "audit_status": "copied",
+                "copy_kind": "model",
+                "copy_source": first_miner,
                 "error": f"model digest was committed first by {first_miner}",
             }
         active_blacklist = _active_blacklist(
@@ -1806,7 +1811,6 @@ class ValidatorRunner:
             ),
             "weights_submitted": weights_submitted,
             "weight_error": self.state.get("last_weight_error"),
-            "history_cursor": self.state["history_cursor"],
             "champions": len(self.state.get("champions", [])),
             "scratch_cleaned": scratch_cleaned,
             "wandb_results": wandb_report,

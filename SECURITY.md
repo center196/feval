@@ -84,14 +84,15 @@ not import or execute verifier code from the dataset or a miner. Unsupported,
 malformed, non-binary, suspicious, URL-bearing, secret-requesting, or
 command-like prompts are excluded deterministically.
 
-## History and rewards
+## Current commitments and rewards
 
-Only commitments from the most recent 50,400 finalized blocks—approximately
-seven days at a 12-second block time—participate in copy priority and current
-evaluation. Saved priority and rollout fingerprints older than that cutoff are
-pruned. A miner must recommit to remain eligible. Validators reconstruct that
-rolling interval in bounded 10,000-block batches and do not emit weights while
-their recent-history index is incomplete.
+Validators consider only miners that currently have a subnet UID and a valid
+Feval commitment. Subtensor supplies each current commitment's chain-assigned
+submission block together with its metadata. For identical current model
+digests or rollout bytes, the earlier current commitment block has priority;
+the hotkey breaks a same-block tie deterministically. Replacing a commitment or
+leaving the current miner set removes that priority. Validators do not require
+historical block scans or an archive RPC endpoint.
 
 Only the positive-scoring active king receives miner emission: 10% to that UID
 and 90% to burn UID 0. With no eligible king, UID 0 receives 100%. Promotion
@@ -111,7 +112,7 @@ requires the configured statistical lower bound to clear the 1% margin.
   mainnet use; a mismatch fails closed rather than granting a score.
 - Regex/counting instruction predicates have semantic edge cases. Version and
   fuzz-test every verifier change.
-- Hub, chain, archive RPC, disk, or GPU outages can delay evaluation. They do
+- Hub, chain RPC, disk, or GPU outages can delay evaluation. They do
   not turn invalid evidence into a valid score.
 
 ## Operator checklist
@@ -120,8 +121,7 @@ requires the configured statistical lower bound to clear the 1% margin.
 - Give Hub credentials read-only scope, or omit them for public repositories.
 - Allow outbound traffic only to required Bittensor RPC and Hugging Face hosts.
 - Never enable arbitrary remote LoRA loading or Hugging Face remote code.
-- Persist and back up validator state; monitor history lag, dataset-root
-  disagreement, changing revisions, failed audits, disk use, and skipped weight
-  intervals.
+- Persist and back up validator state; monitor dataset-root disagreement,
+  changing revisions, failed audits, disk use, and skipped weight intervals.
 - Pin and test Python, vLLM, PyTorch, SafeTensors, CUDA, drivers, and GPU model.
 - Test protocol upgrades on a dedicated subnet before coordinated adoption.

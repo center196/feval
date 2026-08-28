@@ -117,19 +117,6 @@ feval validator run \
   -w <wallet-name> -H <hotkey-name> -n <network>
 ```
 
-On first startup, a validator reconstructs model priority from the most recent
-seven days of finalized chain history before normal operation. An
-archive-capable endpoint is required. To run that synchronization explicitly:
-
-```bash
-feval validator sync-history \
-  --config network.json \
-  --work-dir validator-work \
-  --state validator-state.json \
-  --until-ready \
-  -w <wallet-name> -H <hotkey-name> -n finney
-```
-
 Check liveness with `feval health --state validator-state.json`. See
 `feval validator export-results --help` to publish a sanitized result summary.
 
@@ -152,9 +139,11 @@ change the fixed 2,048-token output cap. Dataset changes are manual protocol
 upgrades. Validators score all rows locally, then verify unpredictable samples
 against the committed adapter using exact greedy-token checks. Eligibility
 requires 10 successful rounds of 32 distinct rows; auditing continues for 20
-rounds. Exact model and exact full-rollout copies belong to the earliest recent
-commitment. Copy priority is retained for seven days (50,400 finalized blocks),
-after which a miner must recommit.
+rounds. Validators consider only currently registered miners with valid Feval
+metadata. Exact model and exact full-rollout copies belong to the earlier
+current commitment block, with the hotkey as a deterministic same-block tie
+breaker. Replacing a commitment or leaving the current miner set removes its
+priority.
 
 The local math checker is deliberately narrower than NVIDIA's full symbolic
 math tooling, and the instruction checker implements only its reviewed safe

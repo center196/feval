@@ -479,30 +479,6 @@ def cmd_validator_run(args: argparse.Namespace) -> None:
             runner.close()
 
 
-def cmd_validator_sync_history(args: argparse.Namespace) -> None:
-    try:
-        runner = ValidatorRunner(
-            config_path=args.config,
-            wallet=args.wallet,
-            hotkey=args.wallet_hotkey,
-            network=args.network,
-            wallet_path=args.wallet_path,
-            work_dir=args.work_dir,
-            state_path=args.state,
-            dry_run_weights=True,
-        )
-        with runner.process_lock():
-            while True:
-                report = runner.sync_history_once()
-                _print_result("commitment history", report)
-                if report["ready"] or not args.until_ready:
-                    break
-    except KeyboardInterrupt:
-        print("history sync stopped")
-    except Exception as exc:
-        fail(str(exc))
-
-
 def cmd_health(args: argparse.Namespace) -> None:
     try:
         report = check_health(args.state, max_age_seconds=args.max_age_seconds)
@@ -783,21 +759,6 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--dry-run-weights", action="store_true")
     _add_runtime_wallet_args(run)
     run.set_defaults(func=cmd_validator_run)
-    sync_history = validator_sub.add_parser(
-        "sync-history",
-        help="Rebuild immutable model priority from finalized chain history.",
-        formatter_class=FevalHelpFormatter,
-    )
-    sync_history.add_argument(
-        "--config",
-        default="network.json",
-        help="Network config path. Defaults to code-pinned subnet-47 constants.",
-    )
-    sync_history.add_argument("--work-dir", required=True)
-    sync_history.add_argument("--state", required=True)
-    sync_history.add_argument("--until-ready", action="store_true")
-    _add_runtime_wallet_args(sync_history)
-    sync_history.set_defaults(func=cmd_validator_sync_history)
     export_results = validator_sub.add_parser(
         "export-results",
         help="Export public per-miner summary results and a leaderboard.",

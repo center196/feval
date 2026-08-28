@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 
-PROTOCOL_NETWORK = "feval-network-v25"
+PROTOCOL_NETWORK = "feval-network-v26"
 PROTOCOL_MODEL_COMMITMENT = "f3"
 PROTOCOL_MODEL_MANIFEST = "feval-model-v4"
 PROTOCOL_ROLLOUT_MANIFEST = "feval-rollouts-v15"
-PROTOCOL_VALIDATOR_STATE = "feval-validator-state-v26"
+PROTOCOL_VALIDATOR_STATE = "feval-validator-state-v27"
 PROTOCOL_MINER_ROLLOUT_STATE = "feval-miner-rollout-state-v12"
 
 SUBNET_NETUID = 47
@@ -15,10 +15,6 @@ PROMOTION_CONFIDENCE_Z = 2.326347874
 CHAMPION_SHARES = (0.10,)
 BURN_SHARE = 0.90
 CHALLENGER_SHARE = 0.0
-HISTORY_BATCH_BLOCKS = 10_000
-# Only recent priority is relevant. At the target 12-second block time this is
-# seven days, and miners must recommit if they want an older model considered.
-HISTORY_LOOKBACK_BLOCKS = 7 * 24 * 60 * 5
 INVALID_ROUNDS_BEFORE_BLACKLIST = 3
 BLACKLIST_ENABLED = False
 # Bittensor targets roughly one finalized block per 12 seconds. Protocol time

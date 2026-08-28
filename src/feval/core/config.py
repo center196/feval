@@ -22,7 +22,6 @@ from .constants import (
     CHAMPION_SHARES,
     DATASET_WINDOW_BLOCKS,
     EVALUATION_ROWS,
-    HISTORY_BATCH_BLOCKS,
     INVALID_ROUNDS_BEFORE_BLACKLIST,
     INSTRUCTION_DATASET,
     INSTRUCTION_DATASET_REVISION,
@@ -72,7 +71,6 @@ class NetworkConfig:
     max_context_tokens: int = MAX_CONTEXT_TOKENS
     max_lora_rank: int = MAX_LORA_RANK
     tensor_parallel_size: int = 1
-    history_batch_blocks: int = HISTORY_BATCH_BLOCKS
     champion_count: int = CHAMPION_COUNT
     champion_shares: tuple[float, ...] = CHAMPION_SHARES
     burn_share: float = BURN_SHARE
@@ -166,8 +164,6 @@ class NetworkConfig:
                 "production requires immutable 40-character Hugging Face dataset revisions; "
                 "replace both dataset revisions in the network config"
             )
-        if self.history_batch_blocks <= 0:
-            raise ValueError("history_batch_blocks must be positive")
         if self.champion_count != CHAMPION_COUNT:
             raise ValueError(f"this protocol requires exactly {CHAMPION_COUNT} champions")
         if tuple(self.champion_shares) != CHAMPION_SHARES:
@@ -229,8 +225,9 @@ class NetworkConfig:
             "feval-network-v22",
             "feval-network-v23",
             "feval-network-v24",
+            "feval-network-v25",
         }:
-            # Operational compatibility for already-sealed test files. All
+            # Operational compatibility for previously sealed configurations. All
             # code-pinned evaluation and audit-size fields take their current
             # canonical values.
             value["protocol"] = PROTOCOL_NETWORK
@@ -260,6 +257,7 @@ class NetworkConfig:
             value["instruction_rows"] = INSTRUCTION_ROWS
             value.pop("candidate_pool_root", None)
             value.pop("history_start_block", None)
+            value.pop("history_batch_blocks", None)
         if isinstance(value.get("champion_shares"), list):
             value["champion_shares"] = tuple(value["champion_shares"])
         known = {field.name for field in cls.__dataclass_fields__.values()}
