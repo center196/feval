@@ -318,10 +318,7 @@ def cmd_miner_leaderboard(args: argparse.Namespace) -> None:
         if result_dirs and artifacts:
             fail("pass --results-dir or --wandb-artifact, not both")
         if not result_dirs and not artifacts:
-            artifacts = discover_running_wandb_results(
-                project=args.wandb_project,
-                entity=args.wandb_entity,
-            )
+            artifacts = discover_running_wandb_results()
             if not artifacts:
                 fail("no running Feval validator result jobs were found in W&B")
         if artifacts:
@@ -513,8 +510,6 @@ def cmd_validator_log_wandb(args: argparse.Namespace) -> None:
     try:
         report = log_results_to_wandb(
             bundle_dir=args.results_dir,
-            project=args.wandb_project,
-            entity=args.wandb_entity,
             run_name=args.wandb_run_name,
         )
     except Exception as exc:
@@ -636,16 +631,6 @@ def build_parser() -> argparse.ArgumentParser:
     board.add_argument("--results-dir", action="append")
     board.add_argument("--wandb-artifact", action="append")
     board.add_argument("--cache-dir")
-    board.add_argument(
-        "--wandb-project",
-        default=os.environ.get("WANDB_PROJECT", "feval-subnet-47"),
-        help="W&B project used for automatic running-validator discovery.",
-    )
-    board.add_argument(
-        "--wandb-entity",
-        default=os.environ.get("WANDB_ENTITY") or None,
-        help="W&B entity used for discovery. Defaults to the logged-in account.",
-    )
     board.add_argument("--limit", type=int, default=20)
     board.add_argument("--expected-summary-root", action="append")
     board.set_defaults(func=cmd_miner_leaderboard)
@@ -774,8 +759,6 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=FevalHelpFormatter,
     )
     log_wandb.add_argument("--results-dir", required=True)
-    log_wandb.add_argument("--wandb-project")
-    log_wandb.add_argument("--wandb-entity")
     log_wandb.add_argument("--wandb-run-name")
     log_wandb.set_defaults(func=cmd_validator_log_wandb)
 

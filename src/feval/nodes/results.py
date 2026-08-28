@@ -6,6 +6,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from ..core.constants import PUBLIC_WANDB_ENTITY, PUBLIC_WANDB_PROJECT
 from ..utils.jsonutil import load_json, write_json, write_jsonl
 from ..protocol.merkle import root_for_values
 
@@ -205,8 +206,6 @@ def leaderboard(bundle_dir: str | Path, limit: int | None = None) -> list[dict[s
 def start_wandb_results_run(
     *,
     bundle_dir: str | Path,
-    project: str | None = None,
-    entity: str | None = None,
     run_name: str | None = None,
     run_id: str | None = None,
 ) -> Any:
@@ -216,14 +215,11 @@ def start_wandb_results_run(
         import wandb
     except ImportError as exc:
         raise RuntimeError("W&B logging requires the 'wandb' package") from exc
-    project = project or os.environ.get("WANDB_PROJECT")
-    entity = entity or os.environ.get("WANDB_ENTITY") or None
-    if not project:
-        raise ValueError("set WANDB_PROJECT or pass --wandb-project")
     manifest, _rows, _board = verify_results_bundle(bundle_dir)
     options: dict[str, Any] = {
-        "project": project,
-        "entity": entity,
+        "project": PUBLIC_WANDB_PROJECT,
+        "entity": PUBLIC_WANDB_ENTITY,
+        "mode": "online",
         "name": run_name
         or os.environ.get("WANDB_RUN_NAME")
         or f"feval-window-{manifest.get('window')}",
@@ -238,8 +234,6 @@ def start_wandb_results_run(
 def log_results_to_wandb(
     *,
     bundle_dir: str | Path,
-    project: str | None = None,
-    entity: str | None = None,
     run_name: str | None = None,
     run_id: str | None = None,
     run: Any | None = None,
@@ -248,18 +242,12 @@ def log_results_to_wandb(
         import wandb
     except ImportError as exc:
         raise RuntimeError("W&B logging requires the 'wandb' package") from exc
-    project = project or os.environ.get("WANDB_PROJECT")
-    entity = entity or os.environ.get("WANDB_ENTITY") or None
-    if not project:
-        raise ValueError("set WANDB_PROJECT or pass --wandb-project")
     manifest, rows, board = verify_results_bundle(bundle_dir)
     root = Path(bundle_dir)
     owns_run = run is None
     if run is None:
         run = start_wandb_results_run(
             bundle_dir=bundle_dir,
-            project=project,
-            entity=entity,
             run_name=run_name,
             run_id=run_id,
         )
@@ -328,14 +316,14 @@ def log_results_to_wandb(
     wait_for_upload = getattr(logged_artifact, "wait", None)
     if callable(wait_for_upload):
         wait_for_upload()
-    artifact_ref = f"{project}/{artifact_name}:latest"
-    if entity:
-        artifact_ref = f"{entity}/{artifact_ref}"
+    artifact_ref = (
+        f"{PUBLIC_WANDB_ENTITY}/{PUBLIC_WANDB_PROJECT}/{artifact_name}:latest"
+    )
     if owns_run:
         run.finish()
     return {
-        "project": project,
-        "entity": entity,
+        "project": PUBLIC_WANDB_PROJECT,
+        "entity": PUBLIC_WANDB_ENTITY,
         "artifact": artifact_ref,
         "run_id": getattr(run, "id", run_id),
         "run_url": getattr(run, "url", None),
@@ -353,23 +341,18 @@ def download_wandb_results(*, artifact: str, out_dir: str | Path) -> dict[str, A
     return {"out_dir": str(downloaded), "window": manifest.get("window"), "rows": manifest.get("rows")}
 
 
-def discover_running_wandb_results(
-    *,
-    project: str | None = None,
-    entity: str | None = None,
-) -> list[str]:
+def discover_running_wandb_results() -> list[str]:
     """Return the newest result artifact from every running validator job."""
 
     try:
         import wandb
     except ImportError as exc:
         raise RuntimeError("W&B result discovery requires the 'wandb' package") from exc
-    project = project or os.environ.get("WANDB_PROJECT") or "feval-subnet-47"
     api = wandb.Api()
-    entity = entity or os.environ.get("WANDB_ENTITY") or api.default_entity
-    if not entity:
-        raise ValueError("set WANDB_ENTITY or log in to W&B with a default entity")
-    runs = api.runs(f"{entity}/{project}", filters={"state": "running"})
+    runs = api.runs(
+        f"{PUBLIC_WANDB_ENTITY}/{PUBLIC_WANDB_PROJECT}",
+        filters={"state": "running"},
+    )
     references: list[str] = []
     for run in runs:
         if str(getattr(run, "job_type", "")) != "validator-results":
@@ -391,7 +374,9 @@ def discover_running_wandb_results(
         if not name:
             continue
         references.append(
-            name if name.count("/") >= 2 else f"{entity}/{project}/{name}"
+            name
+            if name.count("/") >= 2
+            else f"{PUBLIC_WANDB_ENTITY}/{PUBLIC_WANDB_PROJECT}/{name}"
         )
     return sorted(set(references))
 

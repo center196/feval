@@ -95,6 +95,12 @@ A validator reads miner commitments, pins immutable Hugging Face revisions,
 scores each complete rollout set, audits sampled token traces with the
 committed LoRA, and submits weights.
 
+The `feval196-feval/feval-valid` W&B project is Open, so validators do not need
+an invitation or team membership. Each validator authenticates with its own
+W&B account by setting `WANDB_API_KEY`, and Feval automatically publishes its
+public result summary to this fixed destination. Reporting failures are visible
+in validator status but never change evaluation or emitted weights.
+
 Run continuously:
 
 ```bash

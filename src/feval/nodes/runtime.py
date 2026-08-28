@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import hashlib
+import secrets
 import os
 import shutil
 import sys
@@ -148,6 +148,8 @@ def _initial_state() -> dict[str, Any]:
         "last_promotion_decision": None,
         "invalid_strikes": {},
         "blacklist": {},
+        "wandb_run_id": None,
+        "wandb_run_window": None,
     }
 
 
@@ -884,14 +886,6 @@ class ValidatorRunner:
         self.state = _load_state(self.state_path)
         self.tokenizer = None
         self.audit_engine = None
-        self.report_wandb = os.environ.get("FEVAL_REPORT_WANDB", "1").strip().lower() not in {
-            "0",
-            "false",
-            "no",
-            "off",
-        }
-        self.wandb_project = os.environ.get("WANDB_PROJECT", "feval-subnet-47").strip()
-        self.wandb_entity = os.environ.get("WANDB_ENTITY", "").strip() or None
         self.wandb_run = None
         self.wandb_run_window = None
         self.validator_hotkey = None
@@ -1014,6 +1008,8 @@ class ValidatorRunner:
                 }
         self.state["carryover_results"] = next_carryover
         self.state["window"] = window
+        self.state["wandb_run_id"] = None
+        self.state["wandb_run_window"] = window
         self.state["pending"] = {}
         self.state["results"] = {}
         self.state["audited"] = {}
@@ -1592,8 +1588,6 @@ class ValidatorRunner:
     def _maybe_report_results(self) -> dict[str, Any]:
         """Publish only the public summary bundle; reporting never affects consensus."""
 
-        if not getattr(self, "report_wandb", False):
-            return {"status": "disabled"}
         try:
             out_dir = self.work_dir / "results" / f"window-{self.state.get('window')}"
             manifest = export_results_bundle(
@@ -1608,8 +1602,15 @@ class ValidatorRunner:
             if self.wandb_run is None or self.wandb_run_window != window:
                 self._close_wandb_run()
                 validator_hotkey = self._validator_hotkey()
-                identity = f"{self.config.netuid}:{validator_hotkey}:{window}"
-                run_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+                if (
+                    self.state.get("wandb_run_window") != window
+                    or not isinstance(self.state.get("wandb_run_id"), str)
+                    or not self.state.get("wandb_run_id")
+                ):
+                    self.state["wandb_run_id"] = secrets.token_hex(16)
+                    self.state["wandb_run_window"] = window
+                    _atomic_write_json(self.state_path, self.state)
+                run_id = self.state["wandb_run_id"]
                 short_validator = (
                     validator_hotkey
                     if len(validator_hotkey) <= 20
@@ -1617,16 +1618,12 @@ class ValidatorRunner:
                 )
                 self.wandb_run = start_wandb_results_run(
                     bundle_dir=out_dir,
-                    project=self.wandb_project,
-                    entity=self.wandb_entity,
                     run_name=f"feval-{short_validator}-window-{window}",
                     run_id=run_id,
                 )
                 self.wandb_run_window = window
             report = log_results_to_wandb(
                 bundle_dir=out_dir,
-                project=self.wandb_project,
-                entity=self.wandb_entity,
                 run=self.wandb_run,
             )
             self.state["last_wandb_summary_root"] = summary_root
