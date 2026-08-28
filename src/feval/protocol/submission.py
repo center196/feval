@@ -3,12 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .crypto import hash_file, hash_json, sign_payload
-from .dataset import BASE_MODEL
-from .jsonutil import load_json, load_jsonl, write_json, write_jsonl
+from ..utils.crypto import hash_file, hash_json, sign_payload
+from ..core.constants import BASE_MODEL, BASE_MODEL_REVISION
+from ..utils.jsonutil import load_json, load_jsonl, write_json, write_jsonl
 from .merkle import leaf_hash, root_for_values
-from .mock_model import generate_rollout
-from .rewards import reward_for_row
+from ..models.mock_model import generate_rollout
+from ..datasets.rewards import reward_for_row
 
 
 PROTOCOL_CONFIG = "feval-config-v1"
@@ -23,10 +23,10 @@ def create_demo_files(out_dir: str | Path) -> dict[str, str]:
         "protocol": PROTOCOL_CONFIG,
         "netuid": 47,
         "base_model": BASE_MODEL,
-        "base_hash": hash_json({"base": BASE_MODEL, "revision": "main"}),
+        "base_hash": hash_json({"base": BASE_MODEL, "revision": BASE_MODEL_REVISION}),
         "reward": {"type": "row_verifier", "numeric_tolerance": 1e-6},
         "promotion": {"delta_min": 0.01, "confidence_z": 2.326347874},
-        "emissions": {"current": 0.50, "previous": 0.20, "third": 0.10, "challengers": 0.0},
+        "emissions": {"burn_uid_0": 0.90, "current": 0.10, "challengers": 0.0},
     }
     train_rows = [
         {"row_id": "train-1", "prompt": "2 + 2 =", "expected": ["4"], "task_type": "math", "verifier": "exact_or_numeric"},
@@ -107,5 +107,6 @@ def build_submission(config_path: str | Path, eval_path: str | Path, adapter_pat
     signed["signature"] = sign_payload(payload, key)
     write_json(out_path, signed)
     return signed
+
 
 

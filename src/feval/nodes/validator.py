@@ -2,16 +2,14 @@ from __future__ import annotations
 
 import math
 import random
-import shlex
-import subprocess
 from pathlib import Path
 from typing import Any
 
-from .crypto import hash_file, sha256_hex, verify_signature
-from .jsonutil import canonical_json_bytes, load_json, load_jsonl, write_json
-from .merkle import root_for_values
-from .mock_model import verify_rollout
-from .rewards import reward_for_row
+from ..utils.crypto import hash_file, sha256_hex, verify_signature
+from ..utils.jsonutil import canonical_json_bytes, load_json, load_jsonl, write_json
+from ..protocol.merkle import root_for_values
+from ..models.mock_model import verify_rollout
+from ..datasets.rewards import reward_for_row
 
 
 def _payload_without_signature(submission: dict[str, Any]) -> dict[str, Any]:
@@ -121,28 +119,7 @@ def choose_audit_rows(submission: dict[str, Any], seed: str, count: int, positiv
     return selected
 
 
-def _run_external_backend(command: str, config: dict[str, Any], adapter_path: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
-    request = {"config": config, "adapter_path": adapter_path, "rows": rows}
-    completed = subprocess.run(
-        shlex.split(command),
-        input=canonical_json_bytes(request),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        shell=False,
-        check=False,
-    )
-    if completed.returncode != 0:
-        return {"valid": False, "failures": [{"error": completed.stderr.decode("utf-8", errors="replace")}]}
-    try:
-        import json
-
-        result = json.loads(completed.stdout.decode("utf-8"))
-    except Exception as exc:
-        return {"valid": False, "failures": [{"error": f"invalid verifier JSON: {exc}"}]}
-    return result
-
-
-def audit_submission(config_path: str | Path, eval_path: str | Path, submission_path: str | Path, out_path: str | Path, seed: str, rows: int, keyring_path: str | Path | None = None, backend_command: str | None = None) -> dict[str, Any]:
+def audit_submission(config_path: str | Path, eval_path: str | Path, submission_path: str | Path, out_path: str | Path, seed: str, rows: int, keyring_path: str | Path | None = None) -> dict[str, Any]:
     config = load_json(config_path)
     eval_rows = load_jsonl(eval_path)
     submission = load_json(submission_path)
@@ -153,25 +130,11 @@ def audit_submission(config_path: str | Path, eval_path: str | Path, submission_
     submitted_by_id = {row["row_id"]: row for row in submission.get("rows", [])}
     adapter_path = submission.get("adapter_path")
     failures: list[dict[str, Any]] = []
-    if backend_command:
-        backend_rows = [
-            {
-                "row_id": row_id,
-                "prompt": prompt_by_id[row_id],
-                "answer": submitted_by_id[row_id]["answer"],
-                "tokens": submitted_by_id[row_id]["tokens"],
-            }
-            for row_id in selected
-        ]
-        backend_result = _run_external_backend(backend_command, config, str(adapter_path), backend_rows)
-        if not backend_result.get("valid", False):
-            failures.extend(backend_result.get("failures", [{"error": "external verifier returned invalid"}]))
-    else:
-        adapter = load_json(adapter_path)
-        for row_id in selected:
-            row = submitted_by_id[row_id]
-            if not verify_rollout(adapter, prompt_by_id[row_id], list(row["tokens"])):
-                failures.append({"row_id": row_id, "error": "rollout tokens do not match adapter output"})
+    adapter = load_json(adapter_path)
+    for row_id in selected:
+        row = submitted_by_id[row_id]
+        if not verify_rollout(adapter, prompt_by_id[row_id], list(row["tokens"])):
+            failures.append({"row_id": row_id, "error": "rollout tokens do not match adapter output"})
     report = {
         "protocol": "feval-audit-v1",
         "miner_hotkey": submission.get("miner_hotkey"),
@@ -234,7 +197,7 @@ def promote_candidate(state_path: str | Path, candidate_score_path: str | Path, 
         }))[:16]
         champion = {
             "champion_id": champion_id,
-            "owner_hotkey": score["miner_hotkey"],
+            "miner_hotkey": score["miner_hotkey"],
             "adapter_hash": score["adapter_hash"],
             "score": score["score"],
             "delta": delta,
@@ -242,7 +205,7 @@ def promote_candidate(state_path: str | Path, candidate_score_path: str | Path, 
             "reason": reason,
         }
         champions = [champion] + [old for old in state.get("champions", []) if old.get("adapter_hash") != score["adapter_hash"]]
-        state["champions"] = champions[:3]
+        state["champions"] = champions[:1]
     state["last_promotion_decision"] = {
         "candidate_hotkey": score.get("miner_hotkey"),
         "candidate_adapter_hash": score.get("adapter_hash"),
@@ -264,7 +227,7 @@ def write_weights(state_path: str | Path, score_paths: list[str], audit_paths: l
     audits = {report.get("adapter_hash"): report for report in audit_reports}
     scores_by_hash = {score.get("adapter_hash"): score for score in scores}
     weights: dict[str, float] = {}
-    champion_splits = [0.50, 0.20, 0.10]
+    champion_splits = [0.10]
     for split, champion in zip(champion_splits, state.get("champions", [])):
         adapter_hash = champion.get("adapter_hash")
         score = scores_by_hash.get(adapter_hash, {})
@@ -273,26 +236,27 @@ def write_weights(state_path: str | Path, score_paths: list[str], audit_paths: l
             not score.get("valid")
             or not audit.get("valid")
             or float(score.get("score", 0.0)) <= 0.0
-            or score.get("miner_hotkey") != champion.get("owner_hotkey")
+            or score.get("miner_hotkey") != champion.get("miner_hotkey")
         ):
             continue
-        hotkey = champion["owner_hotkey"]
+        hotkey = champion["miner_hotkey"]
         weights[hotkey] = weights.get(hotkey, 0.0) + split
-    total = sum(weights.values())
-    if total > 0:
-        weights = {hotkey: weight / total for hotkey, weight in sorted(weights.items())}
+    weights = dict(sorted(weights.items()))
     uid_weights = None
     if uid_map_path:
         uid_map = load_json(uid_map_path)
-        uid_weights = {
-            str(uid_map[hotkey]): weight
-            for hotkey, weight in weights.items()
-            if hotkey in uid_map
-        }
-        if not uid_weights:
-            uid_weights = {"0": 1.0}
+        uid_weights = {"0": 0.90}
+        assigned = 0.0
+        for hotkey, weight in weights.items():
+            if hotkey not in uid_map:
+                continue
+            uid = str(uid_map[hotkey])
+            uid_weights[uid] = uid_weights.get(uid, 0.0) + weight
+            assigned += weight
+        uid_weights["0"] += 0.10 - assigned
     report = {"protocol": "feval-weights-v1", "weights": weights, "uid_weights": uid_weights, "champions": state.get("champions", [])}
     write_json(out_path, report)
     return report
+
 
 

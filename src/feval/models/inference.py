@@ -21,20 +21,23 @@ from .artifacts import (
     prepare_runtime_adapter,
     write_rollouts,
 )
-from .config import NetworkConfig
-from .canonical import canonical_max_logprob_gap, canonical_token_choice
-from .constants import (
+from ..core.config import NetworkConfig
+from ..core.constants import (
     AUDIT_GPU_MEMORY_UTILIZATION,
     AUDIT_MAX_NUM_BATCHED_TOKENS,
     AUDIT_MAX_NUM_SEQS,
     DEFAULT_ROLLOUT_BATCH_SIZE,
 )
-from .jsonutil import load_jsonl, write_json
+from ..utils.jsonutil import load_jsonl, write_json
 
 
 _ACTIVE_VLLMS: list[Any] = []
 _SIGNAL_HANDLERS_INSTALLED = False
 _INTERRUPT_REQUESTED = False
+_LORA_ID_LOCK = threading.Lock()
+_LORA_ID_BY_DIGEST: dict[str, int] = {}
+_LORA_DIGEST_BY_ID: dict[int, str] = {}
+_MAX_VLLM_LORA_ID = (1 << 31) - 1
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -46,15 +49,16 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def configure_vllm_environment() -> None:
     # Canonical miner decoding uses vLLM's V1 batch-level custom logits
-    # processor. Cleanup below bounds the EngineCore lifetime.
+    # processor. vLLM 0.27 selects V1 itself; setting the removed VLLM_USE_V1
+    # variable only produces a warning. Cleanup below bounds EngineCore life.
     os.environ.pop("VLLM_USE_V1", None)
-    # Keep worker cleanup bounded as a second line of defence.
+    # Newer vLLM releases always use an EngineCore process for supported model
+    # families. Keep its own worker cleanup bounded as a second line of defence.
     os.environ.setdefault("VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS", "5")
-    # Qwen3.5 uses GDN attention, for which vLLM rejects batch-invariant mode
-    # during engine initialization. Keep this protocol-owned and disabled;
-    # cross-machine numerical ties are handled by the bounded teacher-forced
-    # log-probability rule instead.
-    os.environ["VLLM_BATCH_INVARIANT"] = "0"
+    # Dense Qwen3 is supported by vLLM's batch-invariant kernels. Pin the mode
+    # for miners and validators so request ordering and batch size do not alter
+    # greedy token selection on supported GPUs.
+    os.environ["VLLM_BATCH_INVARIANT"] = "1"
 
 
 def fixed_prompt(prompt: str) -> str:
@@ -113,9 +117,13 @@ def generation_stop_token_ids(tokenizer: Any) -> list[int]:
     eos = getattr(tokenizer, "eos_token_id", None)
     if isinstance(eos, int):
         ids.append(int(eos))
-    im_end = tokenizer.encode("<|im_end|>", add_special_tokens=False)
-    if len(im_end) == 1:
-        ids.append(int(im_end[0]))
+    # Qwen3's pinned tokenizer and model generation config use different EOS
+    # declarations: <|im_end|> and <|endoftext|>, respectively. vLLM observes
+    # the model EOS automatically, so both must be protocol terminal tokens.
+    for special in ("<|im_end|>", "<|endoftext|>"):
+        encoded = tokenizer.encode(special, add_special_tokens=False)
+        if len(encoded) == 1:
+            ids.append(int(encoded[0]))
     return list(dict.fromkeys(ids))
 
 
@@ -129,13 +137,32 @@ def decode_rollout(tokenizer: Any, tokens: list[int]) -> str:
     ).strip()
 
 
+def _runtime_lora_identifier(model_digest: str) -> int:
+    """Allocate a positive signed-int32 vLLM cache key for a model digest."""
+
+    if len(model_digest) != 64 or any(character not in "0123456789abcdef" for character in model_digest):
+        raise ValueError("model digest must be 64 lowercase hexadecimal characters")
+    with _LORA_ID_LOCK:
+        existing = _LORA_ID_BY_DIGEST.get(model_digest)
+        if existing is not None:
+            return existing
+        candidate = (int(model_digest, 16) % _MAX_VLLM_LORA_ID) + 1
+        while True:
+            registered_digest = _LORA_DIGEST_BY_ID.get(candidate)
+            if registered_digest is None or registered_digest == model_digest:
+                _LORA_ID_BY_DIGEST[model_digest] = candidate
+                _LORA_DIGEST_BY_ID[candidate] = model_digest
+                return candidate
+            candidate = 1 if candidate == _MAX_VLLM_LORA_ID else candidate + 1
+
+
 def _lora_request(adapter_dir: str | Path, model_digest: str):
     configure_vllm_environment()
     try:
         from vllm.lora.request import LoRARequest
     except ImportError as exc:
         raise RuntimeError("LoRA inference requires vLLM") from exc
-    identifier = int(model_digest[:15], 16) or 1
+    identifier = _runtime_lora_identifier(model_digest)
     return LoRARequest(f"feval-{model_digest[:12]}", identifier, str(Path(adapter_dir).resolve()))
 
 
@@ -143,11 +170,17 @@ def _new_vllm(
     config: NetworkConfig,
     *,
     max_model_len: int | None = None,
+    reserve_output_token: bool = False,
     max_num_seqs: int | None = None,
     max_num_batched_tokens: int | None = None,
     gpu_memory_utilization: float | None = None,
-    canonical_sampling: bool = False,
 ):
+    if reserve_output_token:
+        # The pinned Qwen3-4B-Base advertises exactly 32,768 positions. Only
+        # vLLM's ignored mandatory output occupies position 32,769; every
+        # miner-controlled token and every audited log-probability remains
+        # inside the model's native limit. Set this before importing vLLM.
+        os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
     configure_vllm_environment()
     try:
         from vllm import LLM
@@ -156,19 +189,19 @@ def _new_vllm(
     # Cover model loading as well as generation, then register_vllm() installs
     # our handler again in case vLLM replaced it during engine construction.
     _install_vllm_shutdown_handlers()
-    effective_max_model_len = int(max_model_len or config.max_context_tokens)
-    if effective_max_model_len <= 0 or effective_max_model_len > config.max_context_tokens:
+    protocol_max_model_len = int(max_model_len or config.max_context_tokens)
+    if protocol_max_model_len <= 0 or protocol_max_model_len > config.max_context_tokens:
         raise ValueError("effective vLLM context length exceeds the protocol context limit")
+    # vLLM requires at least one generated token even when Feval only requests
+    # teacher-forced prompt log-probabilities. Auditors reserve that one
+    # engine-only position beyond the submitted protocol prefix.
+    engine_max_model_len = protocol_max_model_len + int(reserve_output_token)
     runtime_options: dict[str, Any] = {}
     if max_num_batched_tokens is not None:
         runtime_options["max_num_batched_tokens"] = int(max_num_batched_tokens)
         runtime_options["enable_chunked_prefill"] = True
     if gpu_memory_utilization is not None:
         runtime_options["gpu_memory_utilization"] = float(gpu_memory_utilization)
-    if canonical_sampling:
-        from .vllm_sampling import CanonicalNearMaxLogitsProcessor
-
-        runtime_options["logits_processors"] = [CanonicalNearMaxLogitsProcessor]
     return LLM(
         model=config.base_model,
         revision=config.base_revision,
@@ -181,13 +214,12 @@ def _new_vllm(
         dtype="bfloat16",
         enable_lora=True,
         max_lora_rank=config.max_lora_rank,
-        max_model_len=effective_max_model_len,
+        max_model_len=engine_max_model_len,
         max_num_seqs=max_num_seqs,
         tensor_parallel_size=config.tensor_parallel_size,
         seed=0,
         enforce_eager=True,
-        # Feval is a text-only protocol even though Qwen3.5 also ships a vision
-        # encoder.  Avoid loading and warming multimodal processors/modules.
+        # Keep the protocol text-only and avoid tokenizer/chat warmups.
         language_model_only=True,
         enable_prefix_caching=False,
         disable_log_stats=True,
@@ -195,8 +227,8 @@ def _new_vllm(
     )
 
 
-def _call_if_present(owner: Any, name: str) -> None:
-    method = getattr(owner, name, None)
+def _call_if_present(component: Any, name: str) -> None:
+    method = getattr(component, name, None)
     if callable(method):
         method()
 
@@ -205,12 +237,12 @@ def _shutdown_vllm_impl(llm: Any) -> None:
     engine = getattr(llm, "llm_engine", None) or getattr(llm, "engine", None)
     engine_core = getattr(engine, "engine_core", None)
     model_executor = getattr(engine, "model_executor", None)
-    for owner in (llm, engine_core, model_executor, engine):
-        if owner is None:
+    for component in (llm, engine_core, model_executor, engine):
+        if component is None:
             continue
         for name in ("shutdown", "close", "cleanup"):
             with contextlib.suppress(Exception):
-                _call_if_present(owner, name)
+                _call_if_present(component, name)
     with contextlib.suppress(Exception):
         from vllm.distributed.parallel_state import (
             destroy_distributed_environment,
@@ -329,12 +361,25 @@ def _round_up(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
 
 
+def rollout_output_limit(config: NetworkConfig, requested: int | None = None) -> int:
+    value = config.max_output_tokens if requested is None else requested
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("max_output_tokens must be an integer")
+    if value <= 0 or value > config.max_output_tokens:
+        raise ValueError(
+            f"max_output_tokens must be between 1 and {config.max_output_tokens}"
+        )
+    return value
+
+
 def rollout_context_limit(
     *,
     config: NetworkConfig,
     tokenizer: Any,
     rows: list[dict[str, Any]],
+    max_output_tokens: int | None = None,
 ) -> tuple[int, int]:
+    output_limit = rollout_output_limit(config, max_output_tokens)
     max_prompt_tokens = 0
     for row in rows:
         prompt_ids = tokenizer.encode(fixed_prompt(str(row["prompt"])), add_special_tokens=False)
@@ -344,7 +389,7 @@ def rollout_context_limit(
             f"selected evaluation window has a {max_prompt_tokens}-token prompt, which leaves no room "
             f"for generation under the protocol context limit {config.max_context_tokens}"
         )
-    max_new_tokens = min(config.max_output_tokens, config.max_context_tokens - max_prompt_tokens)
+    max_new_tokens = min(output_limit, config.max_context_tokens - max_prompt_tokens)
     required = max_prompt_tokens + max_new_tokens
     # Use the smallest aligned context that can hold the longest prompt plus
     # its prompt-adjusted generation budget.
@@ -356,16 +401,19 @@ def protocol_rollout_tokens(
     tokenizer: Any,
     prompt: str,
     tokens: list[int],
+    *,
+    max_output_tokens: int | None = None,
 ) -> tuple[list[int], list[int]]:
     """Return the single protocol-defined rollout prefix used everywhere.
 
-    Responses are capped at 32K and then further capped by the pinned model
-    context after the fixed prompt. Miner-provided stop or length metadata is
-    deliberately irrelevant.
+    Responses are capped by the fixed protocol-owned 2K limit, then further
+    capped by the pinned model context after the fixed prompt.
+    Per-row miner-provided stop or length metadata is deliberately irrelevant.
     """
 
     prompt_ids = tokenizer.encode(fixed_prompt(prompt), add_special_tokens=False)
-    available = min(config.max_output_tokens, config.max_context_tokens - len(prompt_ids))
+    output_limit = rollout_output_limit(config, max_output_tokens)
+    available = min(output_limit, config.max_context_tokens - len(prompt_ids))
     if available <= 0:
         raise ValueError("rollout prompt leaves no room under the protocol context limit")
     bounded = list(tokens[:available])
@@ -386,7 +434,7 @@ def generate_rollouts_vllm(
     eval_path: str | Path,
     adapter_dir: str | Path,
     model_digest: str,
-    evaluation_seed: str,
+    max_output_tokens: int | None = None,
     batch_size: int = DEFAULT_ROLLOUT_BATCH_SIZE,
     runtime_adapter_dir: str | Path | None = None,
 ) -> list[dict[str, Any]]:
@@ -404,10 +452,12 @@ def generate_rollouts_vllm(
     if actual_digest != model_digest:
         raise ValueError("local adapter does not match the committed model digest")
     tokenizer = load_protocol_tokenizer(config)
+    output_limit = rollout_output_limit(config, max_output_tokens)
     effective_max_model_len, max_prompt_tokens = rollout_context_limit(
         config=config,
         tokenizer=tokenizer,
         rows=rows,
+        max_output_tokens=output_limit,
     )
     _rollout_progress(
         "loading_vllm",
@@ -425,7 +475,6 @@ def generate_rollouts_vllm(
                 config,
                 max_model_len=effective_max_model_len,
                 max_num_seqs=batch_size,
-                canonical_sampling=True,
             )
         )
         _rollout_progress(
@@ -442,7 +491,7 @@ def generate_rollouts_vllm(
                 fixed_prompt("Feval LoRA warmup."),
                 add_special_tokens=False,
             )
-            warmup_max_tokens = min(config.max_output_tokens, config.max_context_tokens - len(warmup_prompt_ids))
+            warmup_max_tokens = min(output_limit, config.max_context_tokens - len(warmup_prompt_ids))
             warmup_params = SamplingParams(
                 temperature=0.0,
                 top_p=1.0,
@@ -460,91 +509,79 @@ def generate_rollouts_vllm(
                 use_tqdm=False,
             )
             _rollout_progress("lora_warmup_ready", requests=warmup_count)
+        # Queue the complete evaluation window in one call. max_num_seqs above
+        # remains the active-sequence limit, so vLLM continuously backfills a
+        # slot as soon as a shorter rollout finishes instead of waiting for the
+        # longest request in an application-level chunk.
+        prompts = [
+            {
+                "prompt_token_ids": tokenizer.encode(
+                    fixed_prompt(str(row["prompt"])),
+                    add_special_tokens=False,
+                )
+            }
+            for row in rows
+        ]
+        request_max_tokens = [
+            min(
+                output_limit,
+                config.max_context_tokens - len(prompt["prompt_token_ids"]),
+            )
+            for prompt in prompts
+        ]
+        if any(value <= 0 for value in request_max_tokens):
+            raise ValueError("a rollout prompt leaves no room for generation under the context limit")
+        params = [
+            SamplingParams(
+                temperature=0.0,
+                top_p=1.0,
+                seed=0,
+                max_tokens=request_max_tokens[index],
+                stop_token_ids=stop_token_ids,
+                detokenize=False,
+                skip_special_tokens=False,
+            )
+            for index in range(len(rows))
+        ]
+        _rollout_progress(
+            "generating_rollouts",
+            queued=len(rows),
+            max_active_sequences=min(batch_size, len(rows)),
+            max_tokens=max(request_max_tokens),
+        )
+        outputs = llm.generate(
+            prompts,
+            sampling_params=params,
+            lora_request=lora,
+            use_tqdm=True,
+        )
+        if len(outputs) != len(rows):
+            raise RuntimeError("vLLM returned a different number of outputs than prompts")
         generated: list[dict[str, Any]] = []
-        for start in range(0, len(rows), batch_size):
-            batch = rows[start : start + batch_size]
-            prompts = [
+        for request_index, (source, request_output) in enumerate(zip(rows, outputs)):
+            completion = request_output.outputs[0]
+            token_ids = [int(item) for item in completion.token_ids]
+            token_budget = request_max_tokens[request_index]
+            finish_reason = getattr(completion, "finish_reason", None)
+            stop_reason = getattr(completion, "stop_reason", None)
+            if finish_reason == "stop":
+                if isinstance(stop_reason, int) and not isinstance(stop_reason, bool):
+                    if not token_ids or token_ids[-1] != int(stop_reason):
+                        token_ids.append(int(stop_reason))
+                elif not token_ids or token_ids[-1] not in stop_token_ids:
+                    raise RuntimeError("vLLM stopped without exposing its terminal token")
+            elif finish_reason == "length":
+                if len(token_ids) != token_budget:
+                    raise RuntimeError("vLLM length finish returned an incomplete rollout")
+            else:
+                raise RuntimeError(f"vLLM returned unsupported finish reason {finish_reason!r}")
+            if len(token_ids) > token_budget:
+                raise RuntimeError("vLLM returned more tokens than the protocol budget")
+            generated.append(
                 {
-                    "prompt_token_ids": tokenizer.encode(
-                        fixed_prompt(str(row["prompt"])),
-                        add_special_tokens=False,
-                    )
+                    "row_id": str(source["row_id"]),
+                    "tokens": token_ids,
                 }
-                for row in batch
-            ]
-            request_max_tokens = [
-                min(
-                    config.max_output_tokens,
-                    config.max_context_tokens - len(prompt["prompt_token_ids"]),
-                )
-                for prompt in prompts
-            ]
-            if any(value <= 0 for value in request_max_tokens):
-                raise ValueError("a rollout prompt leaves no room for generation under the context limit")
-            params = [
-                SamplingParams(
-                    temperature=0.0,
-                    top_p=1.0,
-                    seed=0,
-                    max_tokens=request_max_tokens[index],
-                    stop_token_ids=stop_token_ids,
-                    detokenize=False,
-                    skip_special_tokens=False,
-                    extra_args={
-                        "feval_canonical": {
-                            "evaluation_seed": evaluation_seed,
-                            "model_digest": model_digest,
-                            "row_id": str(row["row_id"]),
-                        }
-                    },
-                )
-                for index, row in enumerate(batch)
-            ]
-            _rollout_progress(
-                "generating_rollout_batch",
-                start=start,
-                end=start + len(batch),
-                rows=len(rows),
-                batch_size=len(batch),
-                max_tokens=max(request_max_tokens),
-            )
-            outputs = llm.generate(
-                prompts,
-                sampling_params=params,
-                lora_request=lora,
-                use_tqdm=True,
-            )
-            if len(outputs) != len(batch):
-                raise RuntimeError("vLLM returned a different number of outputs than prompts")
-            for request_index, (source, request_output) in enumerate(zip(batch, outputs)):
-                completion = request_output.outputs[0]
-                token_ids = [int(item) for item in completion.token_ids]
-                token_budget = request_max_tokens[request_index]
-                finish_reason = getattr(completion, "finish_reason", None)
-                stop_reason = getattr(completion, "stop_reason", None)
-                if finish_reason == "stop":
-                    if isinstance(stop_reason, int) and not isinstance(stop_reason, bool):
-                        if not token_ids or token_ids[-1] != int(stop_reason):
-                            token_ids.append(int(stop_reason))
-                    elif not token_ids or token_ids[-1] not in stop_token_ids:
-                        raise RuntimeError("vLLM stopped without exposing its terminal token")
-                elif finish_reason == "length":
-                    if len(token_ids) != token_budget:
-                        raise RuntimeError("vLLM length finish returned an incomplete rollout")
-                else:
-                    raise RuntimeError(f"vLLM returned unsupported finish reason {finish_reason!r}")
-                if len(token_ids) > token_budget:
-                    raise RuntimeError("vLLM returned more tokens than the protocol budget")
-                generated.append(
-                    {
-                        "row_id": str(source["row_id"]),
-                        "tokens": token_ids,
-                    }
-                )
-            _rollout_progress(
-                "generated_rollout_batch",
-                completed=len(generated),
-                rows=len(rows),
             )
         _rollout_progress("generated_rollouts", rows=len(generated))
         return generated
@@ -563,6 +600,7 @@ def build_rollout_bundle_vllm(
     commitment: ModelCommitment,
     miner_hotkey: str,
     out_dir: str | Path,
+    max_output_tokens: int | None = None,
     batch_size: int = DEFAULT_ROLLOUT_BATCH_SIZE,
 ) -> RolloutManifest:
     eval_manifest = json.loads(Path(eval_manifest_path).read_text(encoding="utf-8"))
@@ -571,12 +609,13 @@ def build_rollout_bundle_vllm(
         Path(out_dir) / "validated-runtime",
         config,
     )
+    output_limit = rollout_output_limit(config, max_output_tokens)
     rows = generate_rollouts_vllm(
         config=config,
         eval_path=eval_path,
         adapter_dir=adapter_dir,
         model_digest=commitment.model_digest,
-        evaluation_seed=str(eval_manifest["evaluation_seed"]),
+        max_output_tokens=output_limit,
         batch_size=batch_size,
         runtime_adapter_dir=runtime_adapter,
     )
@@ -595,7 +634,7 @@ def build_rollout_bundle_vllm(
         rows_sha256=rows_sha256,
         base_model=config.base_model,
         base_revision=config.base_revision,
-        max_output_tokens=config.max_output_tokens,
+        max_output_tokens=output_limit,
     )
     manifest.validate(config)
     write_json(root / "manifest.json", manifest.to_dict())
@@ -612,58 +651,59 @@ def _logprob_value(item: Any) -> float | None:
     return result if math.isfinite(result) else None
 
 
+def _logprob_rank(item: Any) -> int | None:
+    value = getattr(item, "rank", None)
+    if value is None and isinstance(item, dict):
+        value = item.get("rank")
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return int(value)
+
+
 def _token_audit(
     position: Any,
     token_id: int,
     *,
-    evaluation_seed: str,
-    model_digest: str,
-    row_id: str,
-    max_candidates: int,
     min_relative_probability: float,
 ) -> dict[str, Any]:
-    """Recompute the one canonical near-maximum token from prompt logprobs."""
+    """Accept only rank-one greedy tokens at the configured probability floor."""
 
     invalid = {
         "valid": False,
         "rank": None,
         "logprob_gap": None,
-        "expected_token_id": None,
-        "candidate_token_ids": [],
+        "accepted_token_ids": [],
     }
     if position is None:
         return invalid
     try:
-        pairs = [
-            (int(candidate_id), logprob)
+        candidates = [
+            (int(candidate_id), logprob, _logprob_rank(item))
             for candidate_id, item in position.items()
             if (logprob := _logprob_value(item)) is not None
         ]
     except (TypeError, AttributeError, ValueError):
         return invalid
-    if not pairs:
+    if not candidates:
         return invalid
-    pairs.sort(key=lambda pair: (-pair[1], pair[0]))
-    top = pairs[0][1]
-    gap_limit = canonical_max_logprob_gap(min_relative_probability)
-    candidates = [
+    candidates.sort(key=lambda candidate: (-candidate[1], candidate[0]))
+    top = candidates[0][1]
+    gap_limit = -math.log(min_relative_probability)
+    accepted = [
         candidate_id
-        for candidate_id, logprob in pairs[:max_candidates]
+        for candidate_id, logprob, _rank in candidates
         if top - logprob <= gap_limit
     ]
-    expected = canonical_token_choice(
-        candidates,
-        evaluation_seed=evaluation_seed,
-        model_digest=model_digest,
-        row_id=row_id,
-    )
-    submitted = next((item for item in pairs if item[0] == token_id), None)
+    submitted = next((item for item in candidates if item[0] == token_id), None)
+    rank = None if submitted is None else submitted[2]
+    if submitted is not None and rank is None:
+        rank = candidates.index(submitted) + 1
+    gap = None if submitted is None else max(0.0, top - submitted[1])
     return {
-        "valid": token_id == expected,
-        "rank": None if submitted is None else pairs.index(submitted) + 1,
-        "logprob_gap": None if submitted is None else max(0.0, top - submitted[1]),
-        "expected_token_id": expected,
-        "candidate_token_ids": candidates,
+        "valid": token_id in accepted,
+        "rank": rank,
+        "logprob_gap": gap,
+        "accepted_token_ids": accepted,
     }
 
 
@@ -676,7 +716,8 @@ class VllmAuditEngine:
         _rollout_progress(
             "loading_vllm_audit",
             model=config.base_model,
-            max_model_len=config.max_context_tokens,
+            protocol_max_model_len=config.max_context_tokens,
+            engine_max_model_len=config.max_context_tokens + 1,
             max_num_seqs=AUDIT_MAX_NUM_SEQS,
             max_num_batched_tokens=AUDIT_MAX_NUM_BATCHED_TOKENS,
             gpu_memory_utilization=AUDIT_GPU_MEMORY_UTILIZATION,
@@ -686,6 +727,7 @@ class VllmAuditEngine:
         self.llm = register_vllm(
             _new_vllm(
                 config,
+                reserve_output_token=True,
                 max_num_seqs=AUDIT_MAX_NUM_SEQS,
                 max_num_batched_tokens=AUDIT_MAX_NUM_BATCHED_TOKENS,
                 gpu_memory_utilization=AUDIT_GPU_MEMORY_UTILIZATION,
@@ -711,7 +753,7 @@ class VllmAuditEngine:
         *,
         adapter_dir: str | Path,
         model_digest: str,
-        evaluation_seed: str,
+        max_output_tokens: int,
         rows: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         try:
@@ -728,16 +770,22 @@ class VllmAuditEngine:
                 self.tokenizer,
                 str(row["prompt"]),
                 list(row["tokens"]),
+                max_output_tokens=max_output_tokens,
             )
             if not response_ids:
                 raise ValueError(f"rollout {row['row_id']!r} is empty")
             prompt_lengths.append(len(prompt_ids))
+            # Keep every submitted token, including the final one, in the same
+            # teacher-forced prefill path. The engine has one additional,
+            # non-protocol position because vLLM requires one generated token.
             inputs.append({"prompt_token_ids": prompt_ids + response_ids})
             normalized_rows.append({**row, "tokens": response_ids})
         params = SamplingParams(
             temperature=0.0,
             max_tokens=1,
-            prompt_logprobs=self.config.canonical_max_candidates,
+            # vLLM returns the top candidate and the actual prompt token. That
+            # is sufficient to compare their probabilities without a rank cap.
+            prompt_logprobs=1,
             detokenize=False,
             skip_special_tokens=False,
         )
@@ -783,56 +831,47 @@ class VllmAuditEngine:
             failure_rank = None
             failure_logprob_gap = None
             exact_argmax_tokens = 0
-            canonical_alternative_tokens = 0
-            failure_expected_token_id = None
-            failure_candidate_token_ids: list[int] = []
+            near_top_tokens = 0
+            failure_accepted_token_ids: list[int] = []
             prompt_logprobs = output.prompt_logprobs
             for offset, token_id in enumerate(source["tokens"]):
                 position = prompt_length + offset
+                position_data = (
+                    prompt_logprobs[position]
+                    if position < len(prompt_logprobs)
+                    else None
+                )
                 verdict = (
-                    {
-                        "valid": False,
-                        "rank": None,
-                        "logprob_gap": None,
-                        "expected_token_id": None,
-                        "candidate_token_ids": [],
-                    }
-                    if position >= len(prompt_logprobs)
-                    else _token_audit(
-                        prompt_logprobs[position],
+                    _token_audit(
+                        position_data,
                         token_id,
-                        evaluation_seed=evaluation_seed,
-                        model_digest=model_digest,
-                        row_id=str(source["row_id"]),
-                        max_candidates=self.config.canonical_max_candidates,
-                        min_relative_probability=self.config.canonical_min_relative_probability,
+                        min_relative_probability=self.config.audit_min_relative_probability,
                     )
                 )
                 if verdict["rank"] == 1:
                     exact_argmax_tokens += 1
                 elif verdict["valid"]:
-                    canonical_alternative_tokens += 1
+                    near_top_tokens += 1
                 if not verdict["valid"] and failure_position is None:
                     failure_position = offset
                     failure_rank = verdict["rank"]
                     failure_logprob_gap = verdict["logprob_gap"]
-                    failure_expected_token_id = verdict["expected_token_id"]
-                    failure_candidate_token_ids = verdict["candidate_token_ids"]
+                    failure_accepted_token_ids = verdict["accepted_token_ids"]
             tokens_checked = len(source["tokens"])
             reports.append(
                 {
                     "row_id": source["row_id"],
                     "valid": failure_position is None,
                     "failure_position": failure_position,
-                    "failure_reason": "token_rank" if failure_position is not None else None,
+                    "failure_reason": "token_not_greedy_argmax" if failure_position is not None else None,
                     "failure_rank": failure_rank,
                     "failure_logprob_gap": failure_logprob_gap,
-                    "failure_expected_token_id": failure_expected_token_id,
-                    "failure_candidate_token_ids": failure_candidate_token_ids,
+                    "failure_accepted_token_ids": failure_accepted_token_ids,
                     "tokens_checked": tokens_checked,
                     "exact_argmax_tokens": exact_argmax_tokens,
                     "exact_argmax_match_ratio": exact_argmax_tokens / tokens_checked,
-                    "canonical_alternative_tokens": canonical_alternative_tokens,
+                    "near_top_tokens": near_top_tokens,
                 }
             )
         return reports
+

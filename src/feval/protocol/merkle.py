@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from .crypto import sha256_hex
-from .jsonutil import canonical_json_bytes
+from ..utils.crypto import sha256_hex
+from ..utils.jsonutil import canonical_json_bytes
 
 
 EMPTY_ROOT = sha256_hex(b"feval-empty-tree")
@@ -33,5 +33,6 @@ def merkle_root(leaves: list[str]) -> str:
 
 def root_for_values(values: list[Any]) -> str:
     return merkle_root([leaf_hash(value) for value in values])
+
 
 

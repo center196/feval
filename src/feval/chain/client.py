@@ -3,9 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .artifacts import ModelCommitment
-from .crypto import sha256_hex
-from .jsonutil import canonical_json_bytes, load_json
+from ..models.artifacts import ModelCommitment
+from ..utils.crypto import sha256_hex
+from ..utils.jsonutil import canonical_json_bytes, load_json
 
 
 def _import_bittensor():
@@ -133,8 +133,8 @@ def _decode_commitment_content(value: Any) -> str | bytes | dict[str, Any]:
     if isinstance(value, (str, bytes)):
         return value
     if isinstance(value, dict):
-        # Accept decoded plaintext and the supported raw CommitmentInfo/Data
-        # representations.
+        # Current v11 reads normally return decoded plaintext. These fallbacks
+        # also accept the raw CommitmentInfo/Data shapes used by local nodes.
         if set(value) >= {"p", "m", "r", "h", "d"}:
             return value
         fields = value.get("fields")
@@ -153,8 +153,9 @@ def _decode_commitment_content(value: Any) -> str | bytes | dict[str, Any]:
         for name in ("commitment", "content", "value", "data"):
             if name in value and value[name] is not None:
                 return _decode_commitment_content(value[name])
-    # Read raw fields before `.value` because the convenience plaintext
-    # representation may omit `BigRaw` content.
+    # The typed v11 `subnets.commitments()` result retains raw fields. Read
+    # them before `.value`: some SDK releases only concatenate `Raw` and omit
+    # `BigRaw` from the convenience plaintext property.
     fields = getattr(value, "fields", None)
     if isinstance(fields, list):
         return _decode_commitment_content({"fields": fields})
@@ -351,8 +352,8 @@ def scan_model_commitment_history(
                 # A successful call with an undecodable signer can only be
                 # attributed when its final storage value is unambiguous.
                 continue
-            # If the decoded signer is unavailable and several hotkeys
-            # successfully committed the same digest in one
+            # Some codec/runtime combinations omit the decoded signer. If
+            # several hotkeys successfully committed the same digest in one
             # block, record all of them; `_copy_filtered` resolves the exact
             # block tie lexicographically and consistently on every validator.
             for row in matches:
@@ -493,5 +494,6 @@ def _result_to_dict(result: Any, dry_run: bool) -> dict[str, Any]:
             "remediation": str(getattr(error, "remediation", "")),
         }
     return data
+
 
 

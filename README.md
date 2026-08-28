@@ -1,56 +1,203 @@
 # Feval
 
-Feval is a Bittensor subnet where miners publish LoRA models and validators
-check their rollouts and assign weights.
+Feval is a Bittensor subnet for evaluating LoRA improvements to a fixed base
+model. Miners publish a model and its rollouts, validators verify the work and
+independently set weights from the same code-pinned protocol rules.
 
 ## Install
 
-Requires Linux or WSL, Python 3.12, an NVIDIA GPU, and a Bittensor wallet.
+Use Linux or WSL with an NVIDIA GPU, a working CUDA driver, Python 3.12, and a
+Bittensor wallet.
 
 ```bash
+git clone <repository-url> feval
+cd feval
 uv venv --python 3.12
 source .venv/bin/activate
 uv pip install -e .
 feval --help
 ```
 
-Miners must copy `.env.example` to `.env` and set `HF_TOKEN` for Hugging Face
-uploads. Do not commit `.env`.
+Copy the environment template only when credentials or reporting settings are
+needed:
+
+```bash
+cp .env.example .env
+```
+
+Set `HF_TOKEN` on miner hosts that upload to Hugging Face. Validators do not
+need a Hugging Face token when model and rollout repositories are public.
+Never commit `.env`, wallet files, private keys, tokens, or validator state.
+
+## Repository layout
+
+```text
+.
++-- src/feval/
+|   +-- cli/          # Command-line interface
+|   +-- core/         # Network config and protocol constants
+|   +-- protocol/     # Deterministic seeds, Merkle roots, and submissions
+|   +-- datasets/     # Dataset loading, filtering, and scoring
+|   +-- models/       # LoRA artifacts, rollout generation, and inference
+|   +-- chain/        # Bittensor commitments, axon serving, and weights
+|   +-- nodes/        # Miner and validator runtime loops
+|   `-- utils/        # Small shared helpers
++-- docs/assets/      # Documentation assets
++-- network.json      # Reviewed local overrides for code-pinned defaults
++-- SECURITY.md       # Trust model and validator hardening notes
++-- THIRD_PARTY_NOTICES.md # Dataset attribution and license summary
+`-- pyproject.toml    # Package metadata and dependencies
+```
 
 ## Miner
 
-A miner trains a LoRA adapter, publishes it, and keeps its rollout repository
-updated. The adapter directory must contain `adapter_config.json` and
-`adapter_model.safetensors`.
+A miner trains a PEFT LoRA for the base model pinned in `network.json`. The
+adapter directory must contain:
 
-Publish the model:
-
-```bash
-feval miner publish-model --adapter-dir output/my-lora --model-repo my-org/my-lora --rollout-repo my-org/my-rollouts -w my-wallet -H my-hotkey -n finney
+```text
+adapter_config.json
+adapter_model.safetensors
 ```
 
-Keep rollouts updated:
+Create one Hugging Face model repository and one Hugging Face dataset
+repository for rollouts. Publish the adapter and commit its immutable revision
+on chain:
 
 ```bash
-feval miner watch-rollouts --adapter-dir output/my-lora --work-dir miner-work -w my-wallet -H my-hotkey -n finney
+feval miner publish-model \
+  --config network.json \
+  --adapter-dir output/my-lora \
+  --model-repo <hf-account>/<model-repo> \
+  --rollout-repo <hf-account>/<rollout-repo> \
+  -w <wallet-name> -H <hotkey-name> -n finney
 ```
+
+Keep the current evaluation-window rollouts updated:
+
+```bash
+feval miner watch-rollouts \
+  --config network.json \
+  --adapter-dir output/my-lora \
+  --work-dir miner-work \
+  --batch-size 16 \
+  --poll-seconds 60 \
+  -w <wallet-name> -H <hotkey-name> -n finney
+```
+
+The watcher uploads a new rollout when the evaluation window or committed
+model changes. Publish the model again before generating rollouts whenever the
+adapter bytes change. Use `feval miner status --help` and
+`feval miner leaderboard --help` to inspect public validator results.
 
 ## Validator
 
-A validator reads miner commitments, checks their models and rollouts, and
-submits weights.
+A validator reads miner commitments, pins immutable Hugging Face revisions,
+scores each complete rollout set, audits sampled token traces with the
+committed LoRA, and submits weights.
+
+Run continuously:
 
 ```bash
-feval validator run --work-dir validator-work --state validator-state.json -w validator-wallet -H validator-hotkey -n finney
+feval validator run \
+  --config network.json \
+  --work-dir validator-work \
+  --state validator-state.json \
+  -w <wallet-name> -H <hotkey-name> -n finney
 ```
 
-Keep `validator-state.json` between restarts.
-
-## Help
+Keep `validator-state.json` and its backup between restarts. To verify a setup
+without submitting weights, run one cycle with:
 
 ```bash
-feval miner --help
-feval validator --help
+feval validator run \
+  --config network.json \
+  --work-dir validator-work \
+  --state validator-state.json \
+  --once --dry-run-weights \
+  -w <wallet-name> -H <hotkey-name> -n <network>
 ```
 
-See [SECURITY.md](SECURITY.md) for security guidance.
+On first startup, a validator reconstructs model priority from the most recent
+seven days of finalized chain history before normal operation. An
+archive-capable endpoint is required. To run that synchronization explicitly:
+
+```bash
+feval validator sync-history \
+  --config network.json \
+  --work-dir validator-work \
+  --state validator-state.json \
+  --until-ready \
+  -w <wallet-name> -H <hotkey-name> -n finney
+```
+
+Check liveness with `feval health --state validator-state.json`. See
+`feval validator export-results --help` to publish a sanitized result summary.
+
+## Evaluation protocol
+
+Every 3,600 finalized blocks, miners and validators derive the same 10,000-row
+evaluation set from immutable, code-pinned NVIDIA dataset revisions:
+
+- 5,000 math rows whose expected answers can be safely verified as complete
+  integers, decimals, or fractions.
+- 5,000 instruction-following rows using binary all-constraints-pass grading
+  from a reviewed set of 30 local deterministic predicates.
+
+At the pinned instruction revision, 16,377 of 46,391 source rows pass the safe
+schema, constraint, and prompt filters, leaving substantial headroom above the
+5,000-row window requirement.
+
+Production commands cannot replace those datasets, reduce the row count, or
+change the fixed 2,048-token output cap. Dataset changes are manual protocol
+upgrades. Validators score all rows locally, then verify unpredictable samples
+against the committed adapter using exact greedy-token checks. Eligibility
+requires 10 successful rounds of 32 distinct rows; auditing continues for 20
+rounds. Exact model and exact full-rollout copies belong to the earliest recent
+commitment. Copy priority is retained for seven days (50,400 finalized blocks),
+after which a miner must recommit.
+
+The local math checker is deliberately narrower than NVIDIA's full symbolic
+math tooling, and the instruction checker implements only its reviewed safe
+subset. This keeps validation deterministic, inexpensive, and free of dataset
+code execution. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for dataset
+licenses and attribution obligations.
+
+## Decentralization
+
+Feval has two operating roles only:
+
+- Miners commit models on chain and publish immutable model and rollout data.
+- Validators independently read finalized chain state, derive the evaluation
+  pool from pinned public dataset revisions, audit miners, and submit weights.
+
+There is no third operational service, privileged protocol key, miner allowlist,
+or centrally supplied launch configuration. The finalized chain, immutable source
+revisions, and versioned protocol code are the shared inputs. Validators can
+compare their independently derived candidate-pool roots with:
+
+```bash
+feval dataset candidate-pool \
+  --config network.json \
+  --out validator-work/candidate-pool.jsonl \
+  --manifest validator-work/candidate-pool.manifest.json
+```
+
+Reporting services such as Weights & Biases are optional mirrors and never
+affect scoring or consensus. Protocol upgrades take effect only when miners and
+validators choose to run the same reviewed protocol version.
+
+`network.json` is a convenient reviewed copy of the defaults. If it is absent,
+the CLI uses the same versioned defaults from the installed code. Any supplied
+file is validated against consensus-critical constants before use.
+
+## Security
+
+Miner repositories are untrusted. Validators accept only bounded JSON,
+JSONL, and SafeTensors inputs and must never run code from miner repositories.
+Keep credentials in local environment variables or `.env`, use least-privilege
+Hugging Face tokens, protect Bittensor wallets, and keep operational work and
+state files outside version control.
+
+See [SECURITY.md](SECURITY.md) for the full trust model and operational
+hardening guidance. Use `feval miner --help`, `feval validator --help`, and
+`feval dataset --help` for all command options.

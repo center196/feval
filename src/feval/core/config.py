@@ -7,18 +7,23 @@ from typing import Any
 from .constants import (
     AUDIT_DETECTION_CONFIDENCE,
     AUDIT_DELAY_BLOCKS,
+    AUDIT_MIN_EXACT_ARGMAX_RATIO,
     AUDIT_MIN_FAKE_ROW_FRACTION,
+    AUDIT_MIN_RELATIVE_PROBABILITY,
     AUDIT_ROWS_PER_ROUND,
+    AUDIT_TOTAL_ROUNDS,
     BASE_MODEL,
     BASE_MODEL_REVISION,
-    CANONICAL_MAX_CANDIDATES,
-    CANONICAL_MIN_RELATIVE_PROBABILITY,
+    BLACKLIST_ENABLED,
+    BLACKLIST_DURATION_BLOCKS,
+    BURN_SHARE,
     CHALLENGER_SHARE,
     CHAMPION_COUNT,
     CHAMPION_SHARES,
     DATASET_WINDOW_BLOCKS,
     EVALUATION_ROWS,
     HISTORY_BATCH_BLOCKS,
+    INVALID_ROUNDS_BEFORE_BLACKLIST,
     INSTRUCTION_DATASET,
     INSTRUCTION_DATASET_REVISION,
     INSTRUCTION_ROWS,
@@ -35,7 +40,7 @@ from .constants import (
     SUBNET_NETUID,
     WEIGHT_INTERVAL_BLOCKS,
 )
-from .jsonutil import load_json, write_json
+from ..utils.jsonutil import load_json, write_json
 
 
 @dataclass(frozen=True)
@@ -58,22 +63,23 @@ class NetworkConfig:
     audit_rows_per_round: int = AUDIT_ROWS_PER_ROUND
     audit_min_fake_row_fraction: float = AUDIT_MIN_FAKE_ROW_FRACTION
     audit_detection_confidence: float = AUDIT_DETECTION_CONFIDENCE
-    canonical_max_candidates: int = CANONICAL_MAX_CANDIDATES
-    canonical_min_relative_probability: float = CANONICAL_MIN_RELATIVE_PROBABILITY
+    audit_total_rounds: int = AUDIT_TOTAL_ROUNDS
+    audit_min_relative_probability: float = AUDIT_MIN_RELATIVE_PROBABILITY
+    audit_min_exact_argmax_ratio: float = AUDIT_MIN_EXACT_ARGMAX_RATIO
     audit_interval_seconds: int = 420
     max_prompt_chars: int = MAX_PROMPT_CHARS
     max_output_tokens: int = MAX_OUTPUT_TOKENS
     max_context_tokens: int = MAX_CONTEXT_TOKENS
     max_lora_rank: int = MAX_LORA_RANK
     tensor_parallel_size: int = 1
-    # These values bind dataset consensus and commitment history to the
-    # canonical network configuration.
-    candidate_pool_root: str | None = None
-    history_start_block: int | None = None
     history_batch_blocks: int = HISTORY_BATCH_BLOCKS
     champion_count: int = CHAMPION_COUNT
     champion_shares: tuple[float, ...] = CHAMPION_SHARES
+    burn_share: float = BURN_SHARE
     challenger_share: float = CHALLENGER_SHARE
+    invalid_rounds_before_blacklist: int = INVALID_ROUNDS_BEFORE_BLACKLIST
+    blacklist_duration_blocks: int = BLACKLIST_DURATION_BLOCKS
+    blacklist_enabled: bool = BLACKLIST_ENABLED
     promotion_delta_min: float = PROMOTION_DELTA_MIN
     promotion_confidence_z: float = PROMOTION_CONFIDENCE_Z
     bootstrap_min_score: float = 0.0
@@ -124,14 +130,19 @@ class NetworkConfig:
                 "this protocol requires "
                 f"audit_detection_confidence={AUDIT_DETECTION_CONFIDENCE}"
             )
-        if self.canonical_max_candidates != CANONICAL_MAX_CANDIDATES:
+        if self.audit_total_rounds != AUDIT_TOTAL_ROUNDS:
             raise ValueError(
-                f"this protocol requires canonical_max_candidates={CANONICAL_MAX_CANDIDATES}"
+                f"this protocol requires audit_total_rounds={AUDIT_TOTAL_ROUNDS}"
             )
-        if self.canonical_min_relative_probability != CANONICAL_MIN_RELATIVE_PROBABILITY:
+        if self.audit_min_relative_probability != AUDIT_MIN_RELATIVE_PROBABILITY:
             raise ValueError(
-                "this protocol requires canonical_min_relative_probability="
-                f"{CANONICAL_MIN_RELATIVE_PROBABILITY}"
+                "this protocol requires audit_min_relative_probability="
+                f"{AUDIT_MIN_RELATIVE_PROBABILITY}"
+            )
+        if self.audit_min_exact_argmax_ratio != AUDIT_MIN_EXACT_ARGMAX_RATIO:
+            raise ValueError(
+                "this protocol requires audit_min_exact_argmax_ratio="
+                f"{AUDIT_MIN_EXACT_ARGMAX_RATIO}"
             )
         if self.max_prompt_chars != MAX_PROMPT_CHARS:
             raise ValueError(f"this protocol requires max_prompt_chars={MAX_PROMPT_CHARS}")
@@ -140,6 +151,7 @@ class NetworkConfig:
             "weight_interval_blocks",
             "audit_delay_blocks",
             "audit_rows_per_round",
+            "audit_total_rounds",
             "max_output_tokens",
             "max_context_tokens",
         ):
@@ -160,8 +172,21 @@ class NetworkConfig:
             raise ValueError(f"this protocol requires exactly {CHAMPION_COUNT} champions")
         if tuple(self.champion_shares) != CHAMPION_SHARES:
             raise ValueError(f"this protocol requires champion_shares={CHAMPION_SHARES}")
+        if self.burn_share != BURN_SHARE:
+            raise ValueError(f"this protocol requires burn_share={BURN_SHARE}")
         if self.challenger_share != CHALLENGER_SHARE:
             raise ValueError(f"this protocol requires challenger_share={CHALLENGER_SHARE}")
+        if self.invalid_rounds_before_blacklist != INVALID_ROUNDS_BEFORE_BLACKLIST:
+            raise ValueError(
+                "this protocol requires invalid_rounds_before_blacklist="
+                f"{INVALID_ROUNDS_BEFORE_BLACKLIST}"
+            )
+        if self.blacklist_duration_blocks != BLACKLIST_DURATION_BLOCKS:
+            raise ValueError(
+                f"this protocol requires blacklist_duration_blocks={BLACKLIST_DURATION_BLOCKS}"
+            )
+        if self.blacklist_enabled is not BLACKLIST_ENABLED:
+            raise ValueError(f"this protocol requires blacklist_enabled={BLACKLIST_ENABLED}")
         if self.promotion_delta_min != PROMOTION_DELTA_MIN:
             raise ValueError(f"this protocol requires promotion_delta_min={PROMOTION_DELTA_MIN}")
         if self.promotion_confidence_z != PROMOTION_CONFIDENCE_Z:
@@ -174,24 +199,8 @@ class NetworkConfig:
             raise ValueError("this protocol requires mechanism_id=0 and weights_version_key=0")
         if self.netuid != SUBNET_NETUID:
             raise ValueError(f"this protocol is for subnet netuid {SUBNET_NETUID}")
-        if production:
-            root = self.candidate_pool_root or ""
-            if len(root) != 64 or any(character not in "0123456789abcdef" for character in root):
-                raise ValueError(
-                    "validator production mode requires a sealed network.json with a "
-                    "64-character candidate_pool_root. Protocol constants are code-pinned; "
-                    "the sealed root is an optional launch hardening value. Use the "
-                    "canonical sealed subnet config, or create it during launch with "
-                    "feval dataset candidate-pool "
-                    "--sealed-config-out network.sealed.json --history-start-block <block>."
-                )
-            if self.history_start_block is None or self.history_start_block <= 0:
-                raise ValueError(
-                    "validator production mode requires a sealed network.json with a "
-                    "positive history_start_block."
-                )
-            if self.netuid <= 0:
-                raise ValueError("production requires a positive mainnet netuid")
+        if production and self.netuid <= 0:
+            raise ValueError("production requires a positive mainnet netuid")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -204,19 +213,55 @@ class NetworkConfig:
             "feval-network-v6",
             "feval-network-v7",
             "feval-network-v8",
+            "feval-network-v9",
+            "feval-network-v10",
+            "feval-network-v11",
+            "feval-network-v12",
+            "feval-network-v13",
+            "feval-network-v14",
+            "feval-network-v15",
+            "feval-network-v16",
+            "feval-network-v17",
+            "feval-network-v18",
+            "feval-network-v19",
+            "feval-network-v20",
+            "feval-network-v21",
+            "feval-network-v22",
+            "feval-network-v23",
+            "feval-network-v24",
         }:
+            # Operational compatibility for already-sealed test files. All
+            # code-pinned evaluation and audit-size fields take their current
+            # canonical values.
             value["protocol"] = PROTOCOL_NETWORK
+            value["base_model"] = BASE_MODEL
+            value["base_revision"] = BASE_MODEL_REVISION
             value.pop("audit_max_logprob_gap", None)
             value.pop("audit_required_rounds", None)
             value.pop("audit_min_exact_match_ratio", None)
+            value["audit_rows_per_round"] = AUDIT_ROWS_PER_ROUND
             value["audit_min_fake_row_fraction"] = AUDIT_MIN_FAKE_ROW_FRACTION
             value["audit_detection_confidence"] = AUDIT_DETECTION_CONFIDENCE
-            value["canonical_max_candidates"] = CANONICAL_MAX_CANDIDATES
-            value["canonical_min_relative_probability"] = CANONICAL_MIN_RELATIVE_PROBABILITY
+            value["audit_total_rounds"] = AUDIT_TOTAL_ROUNDS
+            value.pop("canonical_max_candidates", None)
+            value.pop("canonical_min_relative_probability", None)
+            value.pop("audit_max_token_rank", None)
+            value["audit_min_relative_probability"] = AUDIT_MIN_RELATIVE_PROBABILITY
+            value["audit_min_exact_argmax_ratio"] = AUDIT_MIN_EXACT_ARGMAX_RATIO
             value["challenger_share"] = CHALLENGER_SHARE
+            value["champion_count"] = CHAMPION_COUNT
+            value["champion_shares"] = list(CHAMPION_SHARES)
+            value["burn_share"] = BURN_SHARE
+            value["invalid_rounds_before_blacklist"] = INVALID_ROUNDS_BEFORE_BLACKLIST
+            value["blacklist_duration_blocks"] = BLACKLIST_DURATION_BLOCKS
+            value["blacklist_enabled"] = BLACKLIST_ENABLED
             value["evaluation_rows"] = EVALUATION_ROWS
             value["math_rows"] = MATH_ROWS
             value["instruction_rows"] = INSTRUCTION_ROWS
+            value.pop("candidate_pool_root", None)
+            value.pop("history_start_block", None)
+        if isinstance(value.get("champion_shares"), list):
+            value["champion_shares"] = tuple(value["champion_shares"])
         known = {field.name for field in cls.__dataclass_fields__.values()}
         unknown = set(value) - known
         if unknown:
@@ -227,14 +272,23 @@ class NetworkConfig:
 
 
 def default_network_config_path() -> Path:
-    return Path(__file__).resolve().parents[1] / "network.json"
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "network.json"
+        if (parent / "pyproject.toml").exists() and candidate.exists():
+            return candidate
+    return Path("network.json")
+
+
+def _is_default_network_config_request(path: str | Path) -> bool:
+    requested = Path(path)
+    return requested.name == "network.json" and requested.parent in (Path("."), Path(""))
 
 
 def _resolve_network_config_path(path: str | Path) -> Path:
     requested = Path(path)
     if requested.exists() or requested.is_absolute():
         return requested
-    if requested.name == "network.json" and requested.parent in (Path("."), Path("")):
+    if _is_default_network_config_request(requested):
         default_path = default_network_config_path()
         if default_path.exists():
             return default_path
@@ -242,7 +296,11 @@ def _resolve_network_config_path(path: str | Path) -> Path:
 
 
 def load_network_config(path: str | Path, *, production: bool = False) -> NetworkConfig:
-    config = NetworkConfig.from_dict(load_json(_resolve_network_config_path(path)))
+    resolved = _resolve_network_config_path(path)
+    if not resolved.exists() and _is_default_network_config_request(path):
+        config = NetworkConfig()
+    else:
+        config = NetworkConfig.from_dict(load_json(resolved))
     config.validate(production=production)
     return config
 
@@ -252,25 +310,3 @@ def write_network_config(path: str | Path, *, netuid: int = SUBNET_NETUID) -> Ne
     write_json(path, config.to_dict())
     return config
 
-
-def seal_network_config(
-    path: str | Path,
-    *,
-    candidate_pool_root: str,
-    history_start_block: int,
-) -> NetworkConfig:
-    """Seal the consensus roots and launch block into a network config."""
-
-    value = load_json(path)
-    existing_root = value.get("candidate_pool_root")
-    existing_start = value.get("history_start_block")
-    if existing_root is not None and existing_root != candidate_pool_root:
-        raise ValueError("network config is already sealed with a different candidate pool root")
-    if existing_start is not None and int(existing_start) != int(history_start_block):
-        raise ValueError("network config is already sealed with a different history start block")
-    value["candidate_pool_root"] = candidate_pool_root
-    value["history_start_block"] = int(history_start_block)
-    config = NetworkConfig.from_dict(value)
-    config.validate(production=True)
-    write_json(path, config.to_dict())
-    return config

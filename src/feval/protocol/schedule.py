@@ -5,7 +5,7 @@ import math
 import random
 from typing import Iterable
 
-from .jsonutil import canonical_json_bytes
+from ..utils.jsonutil import canonical_json_bytes
 
 
 def dataset_window(block: int, window_blocks: int = 3_600) -> int:
@@ -97,3 +97,24 @@ def required_audit_rounds(
     statistical_rounds = math.ceil(samples / rows_per_round)
     full_coverage_rounds = math.ceil(population / rows_per_round)
     return min(statistical_rounds, full_coverage_rounds)
+
+
+def audit_detection_probability(*, population: int, forged_rows: int, samples: int) -> float:
+    """Exact probability of sampling at least one forged row without replacement."""
+
+    if population <= 0:
+        raise ValueError("population must be positive")
+    if forged_rows < 0 or forged_rows > population:
+        raise ValueError("forged_rows must be between zero and population")
+    if samples < 0 or samples > population:
+        raise ValueError("samples must be between zero and population")
+    if forged_rows == 0 or samples == 0:
+        return 0.0
+    if samples > population - forged_rows:
+        return 1.0
+    log_miss = sum(
+        math.log(population - forged_rows - index) - math.log(population - index)
+        for index in range(samples)
+    )
+    return -math.expm1(log_miss)
+

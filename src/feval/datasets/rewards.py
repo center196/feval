@@ -103,6 +103,17 @@ def _paragraphs(text: str) -> list[str]:
     return [part.strip() for part in parts if part.strip()]
 
 
+def _divider_paragraphs(text: str) -> list[str]:
+    parts = re.split(r"\s?\*\*\*\s?", text)
+    if any(not part.strip() for part in parts[1:-1]):
+        return []
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _blank_line_paragraphs(text: str) -> list[str]:
+    return [part.strip() for part in re.split(r"\n\n", text) if part.strip()]
+
+
 def _last_word(text: str) -> str:
     words = _words(text)
     return words[-1].lower() if words else ""
@@ -266,8 +277,11 @@ def _check_constraint(answer: str, constraint: dict[str, Any]) -> bool:
             and _words(paragraphs[nth - 1])[0].lower() == expected_word
         )
 
+    if constraint_id == "paragraphs:paragraphs":
+        return len(_divider_paragraphs(answer)) == 2
+
     if constraint_id == "paragraphs:paragraphs2":
-        return len(_paragraphs(answer)) == 2
+        return len(_blank_line_paragraphs(answer)) == 2
 
     if constraint_id == "count:count_unique":
         words = [word.lower() for word in _words(answer)]

@@ -3,9 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .config import NetworkConfig
-from .constants import BASE_MODEL, MAX_LORA_RANK
-from .jsonutil import write_json
+from ..core.config import NetworkConfig
+from ..core.constants import BASE_MODEL, MAX_LORA_RANK
+from ..utils.jsonutil import write_json
 
 
 DEFAULT_RANDOM_TARGET_MODULES = ("q_proj", "v_proj")
@@ -62,6 +62,7 @@ def _base_dimensions(config: NetworkConfig) -> dict[str, int]:
     head_dim = _get_config_int(configs, ("head_dim", "attention_head_dim"), default=hidden // attention_heads)
     return {
         "hidden_size": hidden,
+        "attention_size": attention_heads * head_dim,
         "intermediate_size": intermediate,
         "num_hidden_layers": layers,
         "key_value_size": key_value_heads * head_dim,
@@ -72,10 +73,13 @@ def _module_shape(module: str, dims: dict[str, int]) -> tuple[int, int]:
     hidden = dims["hidden_size"]
     intermediate = dims["intermediate_size"]
     key_value = dims["key_value_size"]
-    if module in {"q_proj", "o_proj"}:
-        return hidden, hidden
+    attention = dims["attention_size"]
+    if module == "q_proj":
+        return attention, hidden
     if module in {"k_proj", "v_proj"}:
         return key_value, hidden
+    if module == "o_proj":
+        return hidden, attention
     if module in {"gate_proj", "up_proj"}:
         return intermediate, hidden
     if module == "down_proj":
@@ -128,11 +132,13 @@ def write_random_lora(
                 generator=generator,
                 dtype=torch.float16,
             ) * float(scale)
-            tensors[f"{prefix}.lora_B.weight"] = torch.randn(
+            # Standard zero-impact LoRA initialization: delta = B @ A, so a
+            # zero B makes the adapter exactly equivalent to the base model.
+            # A stays seeded-random to keep this a deterministic test adapter.
+            tensors[f"{prefix}.lora_B.weight"] = torch.zeros(
                 (out_features, rank),
-                generator=generator,
                 dtype=torch.float16,
-            ) * float(scale)
+            )
 
     root = Path(out_dir)
     root.mkdir(parents=True, exist_ok=True)
@@ -157,4 +163,6 @@ def write_random_lora(
         "target_modules": list(target_modules),
         "layers": layer_count,
         "tensors": len(tensors),
+        "zero_effect": True,
     }
+

@@ -6,8 +6,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .jsonutil import load_json, write_json, write_jsonl
-from .merkle import root_for_values
+from ..utils.jsonutil import load_json, write_json, write_jsonl
+from ..protocol.merkle import root_for_values
 
 
 PROTOCOL_RESULTS_MANIFEST = "feval-results-v1"
@@ -38,11 +38,18 @@ def result_rows_from_state(state: dict[str, Any]) -> list[dict[str, Any]]:
     results = state.get("results", {})
     if not isinstance(results, dict):
         raise ValueError("validator state results must be an object")
+    carryover = state.get("carryover_results", {})
+    if not isinstance(carryover, dict):
+        raise ValueError("validator state carryover_results must be an object")
+    combined = dict(carryover)
+    # A current-window result always supersedes the public carryover snapshot,
+    # even while it is still auditing or has failed this particular revision.
+    combined.update(results)
     last_weights = state.get("last_weights", {})
     if not isinstance(last_weights, dict):
         last_weights = {}
     rows: list[dict[str, Any]] = []
-    for hotkey, result in sorted(results.items()):
+    for hotkey, result in sorted(combined.items()):
         if not isinstance(result, dict):
             continue
         uid = result.get("uid")
@@ -51,15 +58,24 @@ def result_rows_from_state(state: dict[str, Any]) -> list[dict[str, Any]]:
         valid = bool(result.get("valid"))
         audit_status = result.get("audit_status")
         status = (
-            str(audit_status)
-            if audit_status in {"auditing", "retrying"}
-            else _status(valid, final_weight)
+            "carried"
+            if result.get("carryover")
+            else (
+                _status(valid, final_weight)
+                if valid
+                else (
+                    str(audit_status)
+                    if audit_status in {"auditing", "retrying", "blacklisted"}
+                    else _status(valid, final_weight)
+                )
+            )
         )
         row = {
             "hotkey": str(hotkey),
             "uid": uid,
             "valid": valid,
             "status": status,
+            "audit_status": audit_status,
             "score": float(result.get("score", 0.0)),
             "final_weight": final_weight,
             "correct": result.get("correct"),
@@ -72,7 +88,10 @@ def result_rows_from_state(state: dict[str, Any]) -> list[dict[str, Any]]:
             "audited_count": len(result.get("audited_rows", [])),
             "audit_round": result.get("audit_round"),
             "audit_required_rounds": result.get("audit_required_rounds"),
+            "audit_total_rounds": result.get("audit_total_rounds"),
             "audit_exact_match_ratio": result.get("audit_cumulative_exact_match_ratio"),
+            "blacklisted_until_block": result.get("blacklisted_until_block"),
+            "source_window": result.get("source_window"),
             "error": result.get("error"),
         }
         rows.append(row)
@@ -98,6 +117,11 @@ def leaderboard_from_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "score": float(row.get("score") or 0.0),
             "final_weight": float(row.get("final_weight") or 0.0),
             "model_digest": row.get("model_digest"),
+            "audit_status": row.get("audit_status"),
+            "audit_round": row.get("audit_round"),
+            "audit_required_rounds": row.get("audit_required_rounds"),
+            "audit_total_rounds": row.get("audit_total_rounds"),
+            "audited_count": row.get("audited_count"),
             "error": row.get("error"),
         }
         for index, row in enumerate(ordered, start=1)
@@ -178,12 +202,47 @@ def leaderboard(bundle_dir: str | Path, limit: int | None = None) -> list[dict[s
     return rows[:limit]
 
 
+def start_wandb_results_run(
+    *,
+    bundle_dir: str | Path,
+    project: str | None = None,
+    entity: str | None = None,
+    run_name: str | None = None,
+    run_id: str | None = None,
+) -> Any:
+    """Start or resume one continuous validator/window W&B run."""
+
+    try:
+        import wandb
+    except ImportError as exc:
+        raise RuntimeError("W&B logging requires the 'wandb' package") from exc
+    project = project or os.environ.get("WANDB_PROJECT")
+    entity = entity or os.environ.get("WANDB_ENTITY") or None
+    if not project:
+        raise ValueError("set WANDB_PROJECT or pass --wandb-project")
+    manifest, _rows, _board = verify_results_bundle(bundle_dir)
+    options: dict[str, Any] = {
+        "project": project,
+        "entity": entity,
+        "name": run_name
+        or os.environ.get("WANDB_RUN_NAME")
+        or f"feval-window-{manifest.get('window')}",
+        "job_type": "validator-results",
+        "config": manifest,
+    }
+    if run_id:
+        options.update({"id": run_id, "resume": "allow"})
+    return wandb.init(**options)
+
+
 def log_results_to_wandb(
     *,
     bundle_dir: str | Path,
     project: str | None = None,
     entity: str | None = None,
     run_name: str | None = None,
+    run_id: str | None = None,
+    run: Any | None = None,
 ) -> dict[str, Any]:
     try:
         import wandb
@@ -195,21 +254,42 @@ def log_results_to_wandb(
         raise ValueError("set WANDB_PROJECT or pass --wandb-project")
     manifest, rows, board = verify_results_bundle(bundle_dir)
     root = Path(bundle_dir)
-    run = wandb.init(
-        project=project,
-        entity=entity,
-        name=run_name or os.environ.get("WANDB_RUN_NAME") or f"feval-window-{manifest.get('window')}",
-        job_type="validator-results",
-        config=manifest,
-    )
+    owns_run = run is None
+    if run is None:
+        run = start_wandb_results_run(
+            bundle_dir=bundle_dir,
+            project=project,
+            entity=entity,
+            run_name=run_name,
+            run_id=run_id,
+        )
     table = wandb.Table(
-        columns=["rank", "hotkey", "uid", "status", "valid", "score", "final_weight", "error"],
+        columns=[
+            "rank",
+            "hotkey",
+            "uid",
+            "status",
+            "audit_status",
+            "audit_round",
+            "audit_required_rounds",
+            "audit_total_rounds",
+            "audited_count",
+            "valid",
+            "score",
+            "final_weight",
+            "error",
+        ],
         data=[
             [
                 row.get("rank"),
                 row.get("hotkey"),
                 row.get("uid"),
                 row.get("status"),
+                row.get("audit_status"),
+                row.get("audit_round"),
+                row.get("audit_required_rounds"),
+                row.get("audit_total_rounds"),
+                row.get("audited_count"),
                 row.get("valid"),
                 row.get("score"),
                 row.get("final_weight"),
@@ -223,20 +303,43 @@ def log_results_to_wandb(
             "window": manifest.get("window"),
             "miners": len(rows),
             "valid_miners": manifest.get("valid_rows"),
+            "audit_round": max(
+                (int(row.get("audit_round") or 0) for row in rows),
+                default=0,
+            ),
+            "summary_root": manifest.get("summary_root"),
             "leaderboard": table,
         }
     )
-    artifact_name = f"feval-results-window-{manifest.get('window')}"
+    validator = str(manifest.get("validator_hotkey") or "unknown-validator")
+    validator_slug = "".join(
+        character if character.isalnum() or character in {"-", "_"} else "-"
+        for character in validator
+    )
+    artifact_name = f"feval-results-{validator_slug}-window-{manifest.get('window')}"
     artifact = wandb.Artifact(artifact_name, type="feval-results", metadata=manifest)
     artifact.add_file(str(root / "manifest.json"))
     artifact.add_file(str(root / manifest["summary_file"]))
     artifact.add_file(str(root / manifest["leaderboard_file"]))
-    run.log_artifact(artifact, aliases=["latest", f"window-{manifest.get('window')}"])
+    logged_artifact = run.log_artifact(
+        artifact,
+        aliases=["latest", f"window-{manifest.get('window')}"],
+    )
+    wait_for_upload = getattr(logged_artifact, "wait", None)
+    if callable(wait_for_upload):
+        wait_for_upload()
     artifact_ref = f"{project}/{artifact_name}:latest"
     if entity:
         artifact_ref = f"{entity}/{artifact_ref}"
-    run.finish()
-    return {"project": project, "entity": entity, "artifact": artifact_ref}
+    if owns_run:
+        run.finish()
+    return {
+        "project": project,
+        "entity": entity,
+        "artifact": artifact_ref,
+        "run_id": getattr(run, "id", run_id),
+        "run_url": getattr(run, "url", None),
+    }
 
 
 def download_wandb_results(*, artifact: str, out_dir: str | Path) -> dict[str, Any]:
@@ -248,3 +351,47 @@ def download_wandb_results(*, artifact: str, out_dir: str | Path) -> dict[str, A
     downloaded = api.artifact(artifact, type="feval-results").download(root=str(out_dir))
     manifest, _rows, _leaderboard = verify_results_bundle(downloaded)
     return {"out_dir": str(downloaded), "window": manifest.get("window"), "rows": manifest.get("rows")}
+
+
+def discover_running_wandb_results(
+    *,
+    project: str | None = None,
+    entity: str | None = None,
+) -> list[str]:
+    """Return the newest result artifact from every running validator job."""
+
+    try:
+        import wandb
+    except ImportError as exc:
+        raise RuntimeError("W&B result discovery requires the 'wandb' package") from exc
+    project = project or os.environ.get("WANDB_PROJECT") or "feval-subnet-47"
+    api = wandb.Api()
+    entity = entity or os.environ.get("WANDB_ENTITY") or api.default_entity
+    if not entity:
+        raise ValueError("set WANDB_ENTITY or log in to W&B with a default entity")
+    runs = api.runs(f"{entity}/{project}", filters={"state": "running"})
+    references: list[str] = []
+    for run in runs:
+        if str(getattr(run, "job_type", "")) != "validator-results":
+            continue
+        artifacts = [
+            artifact
+            for artifact in run.logged_artifacts()
+            if str(getattr(artifact, "type", "")) == "feval-results"
+        ]
+        if not artifacts:
+            continue
+        latest = [
+            artifact
+            for artifact in artifacts
+            if "latest" in list(getattr(artifact, "aliases", []) or [])
+        ]
+        selected = (latest or artifacts)[-1]
+        name = str(getattr(selected, "name", ""))
+        if not name:
+            continue
+        references.append(
+            name if name.count("/") >= 2 else f"{entity}/{project}/{name}"
+        )
+    return sorted(set(references))
+

@@ -11,8 +11,8 @@ from .artifacts import (
     validate_repo_id,
     validate_revision,
 )
-from .config import NetworkConfig
-from .constants import (
+from ..core.config import NetworkConfig
+from ..core.constants import (
     MAX_ADAPTER_BYTES,
     MAX_ADAPTER_CONFIG_BYTES,
     MAX_MANIFEST_BYTES,
@@ -20,7 +20,7 @@ from .constants import (
     MODEL_FILES,
     ROLLOUT_FILES,
 )
-from .jsonutil import canonical_json_bytes
+from ..utils.jsonutil import canonical_json_bytes
 
 
 def _hub_imports():
@@ -249,3 +249,4 @@ def safe_download_rollouts(
         )
         _require_local_regular_file(root, filename)
     return root
+

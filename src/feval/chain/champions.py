@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import base64
 import math
+from statistics import NormalDist
 from typing import Any
 
-from .artifacts import ModelCommitment
-from .config import NetworkConfig
+from ..models.artifacts import ModelCommitment
+from ..core.config import NetworkConfig
 
 
 def encode_reward_bits(rewards: list[int]) -> str:
@@ -45,7 +46,7 @@ def paired_lcb(candidate: list[int], king: list[int], z: float) -> tuple[float, 
 
 
 def unpaired_lcb(candidate_score: float, king_score: float, rows: int, z: float) -> tuple[float, float]:
-    """Conservative fallback when a champion misses the current window."""
+    """Conservative fallback when an old king misses the current window."""
 
     if rows <= 0 or not 0.0 <= candidate_score <= 1.0 or not 0.0 <= king_score <= 1.0:
         raise ValueError("invalid unpaired score comparison")
@@ -55,6 +56,24 @@ def unpaired_lcb(candidate_score: float, king_score: float, rows: int, z: float)
         + king_score * (1.0 - king_score) / rows
     )
     return delta, delta - z * math.sqrt(variance)
+
+
+def familywise_z(base_z: float, comparisons: int) -> float:
+    """Bonferroni-adjust a one-sided normal threshold for challenger selection.
+
+    Validators choose the strongest result among all challengers. Testing each
+    one at the unadjusted threshold would inflate the chance of replacing the
+    king merely because many miners entered the window.
+    """
+
+    if not math.isfinite(base_z) or base_z <= 0.0:
+        raise ValueError("base confidence z must be positive and finite")
+    if comparisons <= 0:
+        raise ValueError("comparison count must be positive")
+    normal = NormalDist()
+    base_alpha = 1.0 - normal.cdf(base_z)
+    adjusted_alpha = base_alpha / comparisons
+    return normal.inv_cdf(1.0 - adjusted_alpha)
 
 
 def _valid_result(result: dict[str, Any], rows: int) -> bool:
@@ -83,7 +102,7 @@ def update_champions(
     ]
     champions = list(state.setdefault("champions", []))
     for champion in champions:
-        hotkey = str(champion.get("owner_hotkey"))
+        hotkey = str(champion.get("miner_hotkey"))
         result = results.get(hotkey, {})
         if (
             _valid_result(result, config.evaluation_rows)
@@ -119,7 +138,13 @@ def update_champions(
                 decision["reason"] = "bootstrap score below threshold"
     else:
         king = champions[0]
-        king_result = results.get(str(king.get("owner_hotkey")), {})
+        comparison_z = familywise_z(
+            config.promotion_confidence_z,
+            max(1, len(candidates)),
+        )
+        decision["candidate_comparisons"] = len(candidates)
+        decision["comparison_confidence_z"] = comparison_z
+        king_result = results.get(str(king.get("miner_hotkey")), {})
         if (
             _valid_result(king_result, config.evaluation_rows)
             and king_result.get("model_digest") == king.get("model_digest")
@@ -131,7 +156,7 @@ def update_champions(
                     candidate["reward_bits"], config.evaluation_rows
                 )
                 delta, lower_bound = paired_lcb(
-                    candidate_rewards, king_rewards, config.promotion_confidence_z
+                    candidate_rewards, king_rewards, comparison_z
                 )
                 comparisons.append((lower_bound, delta, hotkey, candidate))
             if comparisons:
@@ -152,7 +177,7 @@ def update_champions(
                     decision["reason"] = "improvement below paired confidence threshold"
         else:
             # Preserve liveness if a king disappears. Windows are fixed-size
-            # samples from the same sealed pool, so use a more conservative
+            # samples from the same deterministic pool, so use a more conservative
             # independent-proportions bound against the king's last valid
             # score. Same-window paired comparison remains the preferred path.
             reference = king.get("last_score", king.get("score_at_promotion"))
@@ -163,7 +188,7 @@ def update_champions(
                         float(candidate["score"]),
                         float(reference),
                         config.evaluation_rows,
-                        config.promotion_confidence_z,
+                        comparison_z,
                     )
                     comparisons.append((lower_bound, delta, hotkey, candidate))
             if comparisons:
@@ -188,7 +213,7 @@ def update_champions(
     if promoted is not None:
         hotkey, result, delta, lower_bound = promoted
         champion = {
-            "owner_hotkey": hotkey,
+            "miner_hotkey": hotkey,
             "model_digest": result["model_digest"],
             "model_revision": result.get("model_revision"),
             "score_at_promotion": float(result["score"]),
@@ -221,13 +246,24 @@ def champion_weight_mapping(
     commitments: dict[str, dict[str, Any]],
     copies: dict[str, str],
 ) -> dict[int, float]:
-    """Allocate emission only to positive-scoring active hill champions."""
+    """Burn 90% and allocate 10% only to the positive active current king."""
 
     by_hotkey: dict[str, float] = {}
     for share, champion in zip(config.champion_shares, state.get("champions", [])):
-        hotkey = str(champion.get("owner_hotkey"))
+        hotkey = str(champion.get("miner_hotkey"))
         current = commitments.get(hotkey)
         result = state.get("results", {}).get(hotkey, {})
+        if not (
+            isinstance(result, dict)
+            and result.get("valid")
+            and float(result.get("score", 0.0)) > 0.0
+            and result.get("model_digest") == champion.get("model_digest")
+        ):
+            # Window transitions do not interrupt an already verified king's
+            # emission. Carryover is accepted only for that exact model digest
+            # and only until the king validates again or a challenger replaces
+            # it with a statistically qualified current-window result.
+            result = state.get("carryover_results", {}).get(hotkey, {})
         if (
             current is None
             or hotkey in copies
@@ -242,10 +278,16 @@ def champion_weight_mapping(
             continue
         by_hotkey[hotkey] = by_hotkey.get(hotkey, 0.0) + float(share)
 
-    uid_weights: dict[int, float] = {}
+    uid_weights: dict[int, float] = {0: float(config.burn_share)}
+    allocated = 0.0
     for hotkey, value in by_hotkey.items():
         uid = commitments[hotkey].get("uid")
         if uid is not None:
             uid_weights[int(uid)] = uid_weights.get(int(uid), 0.0) + value
+            allocated += value
+    uid_weights[0] += sum(float(value) for value in config.champion_shares) - allocated
     total = sum(uid_weights.values())
-    return {uid: value / total for uid, value in sorted(uid_weights.items())} if total else {}
+    if not math.isclose(total, 1.0, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError(f"protocol weights must sum to one, received {total}")
+    return dict(sorted(uid_weights.items()))
+

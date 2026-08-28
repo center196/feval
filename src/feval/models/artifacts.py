@@ -8,10 +8,15 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-from .config import NetworkConfig
-from .constants import (
+from ..core.config import NetworkConfig
+from ..core.constants import (
     ALLOWED_LORA_TARGET_MODULES,
+    BASE_ATTENTION_SIZE,
+    BASE_HIDDEN_SIZE,
+    BASE_INTERMEDIATE_SIZE,
+    BASE_KEY_VALUE_SIZE,
     BASE_MODEL,
+    BASE_NUM_HIDDEN_LAYERS,
     MAX_ADAPTER_BYTES,
     MAX_ADAPTER_ELEMENTS,
     MAX_ADAPTER_CONFIG_BYTES,
@@ -28,14 +33,22 @@ from .constants import (
     PROTOCOL_MODEL_MANIFEST,
     PROTOCOL_ROLLOUT_MANIFEST,
 )
-from .crypto import hash_file
-from .jsonutil import canonical_json_bytes, write_json
+from ..utils.crypto import hash_file
+from ..utils.jsonutil import canonical_json_bytes, write_json
 
 
 _REPO_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,95}/[A-Za-z0-9][A-Za-z0-9_.-]{0,95}$")
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _ROW_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,191}$")
+
+
+def _lora_rank_dimension(shape: tuple[int, int], side: str) -> int:
+    if side == "A":
+        return shape[0]
+    if side == "B":
+        return shape[1]
+    raise ValueError("LoRA tensor side must be A or B")
 
 
 def _reject_constant(value: str) -> None:
@@ -173,7 +186,9 @@ class RolloutManifest:
         if self.row_count != config.evaluation_rows:
             raise ValueError(f"rollout must contain exactly {config.evaluation_rows} rows")
         if self.max_output_tokens != config.max_output_tokens:
-            raise ValueError("rollout generation limit does not match network config")
+            raise ValueError(
+                f"rollout generation limit must equal {config.max_output_tokens}"
+            )
         if self.dataset_window < 0:
             raise ValueError("dataset window must be non-negative")
 
@@ -330,7 +345,7 @@ def validate_safetensors(
         raise RuntimeError("SafeTensors validation requires the 'safetensors' package") from exc
     tensor_count = 0
     total_elements = 0
-    pairs: dict[str, dict[str, tuple[int, int]]] = {}
+    pairs: dict[str, dict[str, Any]] = {}
     seen_targets: set[str] = set()
     allowed_dtypes = {"F16", "BF16", "F32"}
     with safe_open(source, framework="pt", device="cpu") as tensors:
@@ -358,24 +373,36 @@ def validate_safetensors(
             dtype = str(view.get_dtype())
             if len(shape) != 2 or any(item <= 0 or item > MAX_TENSOR_DIMENSION for item in shape):
                 raise ValueError(f"forbidden tensor shape for {key!r}: {shape}")
-            match = re.search(
-                r"(?:^|\.)([A-Za-z0-9_]+)\.lora_([AB])(?:\.[A-Za-z0-9_-]+)?\.weight$",
+            match = re.fullmatch(
+                r"(?:base_model\.model\.)?model\.layers\.(\d+)\."
+                r"(self_attn|mlp)\.([A-Za-z0-9_]+)\.lora_([AB])"
+                r"(?:\.[A-Za-z0-9_-]+)?\.weight",
                 key,
             )
-            if not match or match.group(1) not in ALLOWED_LORA_TARGET_MODULES:
+            if not match or match.group(3) not in ALLOWED_LORA_TARGET_MODULES:
                 raise ValueError(f"forbidden LoRA tensor name: {key!r}")
-            target, side = match.group(1), match.group(2)
+            layer, block, target, side = (
+                int(match.group(1)),
+                match.group(2),
+                match.group(3),
+                match.group(4),
+            )
+            if layer >= BASE_NUM_HIDDEN_LAYERS:
+                raise ValueError(f"LoRA tensor layer is outside the base model: {key!r}")
+            expected_block = "self_attn" if target in {"q_proj", "k_proj", "v_proj", "o_proj"} else "mlp"
+            if block != expected_block:
+                raise ValueError(f"LoRA tensor uses the wrong base-model block: {key!r}")
             seen_targets.add(target)
             pair_name = re.sub(
                 r"\.lora_[AB](?:\.[A-Za-z0-9_-]+)?\.weight$",
                 "",
                 key,
             )
-            pair = pairs.setdefault(pair_name, {})
+            pair = pairs.setdefault(pair_name, {"target": target})
             if side in pair:
                 raise ValueError(f"duplicate LoRA {side} tensor for {pair_name!r}")
             pair[side] = shape
-            rank_dimension = shape[0] if match.group(2) == "A" else shape[1]
+            rank_dimension = _lora_rank_dimension(shape, side)
             if rank_dimension > max_rank:
                 raise ValueError(f"LoRA tensor {key!r} exceeds the rank limit")
             if expected_rank is not None and rank_dimension != expected_rank:
@@ -383,9 +410,9 @@ def validate_safetensors(
             if dtype not in allowed_dtypes:
                 raise ValueError(f"forbidden tensor dtype for {key!r}: {dtype}")
             # SafeTensors prevents code execution, but NaN/Inf payloads can
-            # still poison kernels or make canonical decoding undefined. Reading
-            # at most the protocol's 256 MiB limit on CPU is an intentional
-            # validation cost before any miner tensor reaches a GPU.
+            # still poison kernels or make inference verification undefined.
+            # Reading at most the protocol's 256 MiB limit on CPU is an
+            # intentional validation cost before any miner tensor reaches a GPU.
             tensor = tensors.get_tensor(key)
             if not bool(tensor.isfinite().all().item()):
                 raise ValueError(f"LoRA tensor {key!r} contains a non-finite value")
@@ -409,11 +436,26 @@ def validate_safetensors(
             if total_elements > MAX_ADAPTER_ELEMENTS:
                 raise ValueError("adapter tensor element count exceeds the protocol limit")
             tensor_count += 1
+    module_dimensions = {
+        "q_proj": (BASE_ATTENTION_SIZE, BASE_HIDDEN_SIZE),
+        "k_proj": (BASE_KEY_VALUE_SIZE, BASE_HIDDEN_SIZE),
+        "v_proj": (BASE_KEY_VALUE_SIZE, BASE_HIDDEN_SIZE),
+        "o_proj": (BASE_HIDDEN_SIZE, BASE_ATTENTION_SIZE),
+        "gate_proj": (BASE_INTERMEDIATE_SIZE, BASE_HIDDEN_SIZE),
+        "up_proj": (BASE_INTERMEDIATE_SIZE, BASE_HIDDEN_SIZE),
+        "down_proj": (BASE_HIDDEN_SIZE, BASE_INTERMEDIATE_SIZE),
+    }
     for pair_name, pair in pairs.items():
-        if set(pair) != {"A", "B"}:
+        if {name for name in pair if name in {"A", "B"}} != {"A", "B"}:
             raise ValueError(f"LoRA module {pair_name!r} must contain exactly one A/B tensor pair")
         if pair["A"][0] != pair["B"][1]:
             raise ValueError(f"LoRA module {pair_name!r} has inconsistent A/B rank dimensions")
+        out_features, in_features = module_dimensions[str(pair["target"])]
+        rank = pair["A"][0]
+        if pair["A"] != (rank, in_features) or pair["B"] != (out_features, rank):
+            raise ValueError(
+                f"LoRA module {pair_name!r} does not match the pinned base-model shape"
+            )
     if expected_targets is not None and seen_targets != expected_targets:
         raise ValueError(
             "LoRA tensor targets do not match adapter_config.json: "
@@ -431,7 +473,7 @@ def prepare_runtime_adapter(
 
     The miner JSON is validation input, never runtime configuration. This
     protocol-owned minimal config prevents optional PEFT fields from changing
-    loader behavior while preserving the committed tensor bytes.
+    loader behavior while retaining the committed tensor bytes.
     """
 
     source = Path(source_dir)
@@ -505,8 +547,8 @@ def model_manifest(model_repo: str, model_digest: str, config: NetworkConfig) ->
 
 def _validate_rollout_row(value: Any, *, max_output_tokens: int, vocab_size: int | None) -> dict[str, Any]:
     minimal = {"row_id", "tokens"}
-    extended = minimal | {"finish_reason", "stop_reason", "max_tokens"}
-    if not isinstance(value, dict) or frozenset(value) not in {frozenset(minimal), frozenset(extended)}:
+    legacy = minimal | {"finish_reason", "stop_reason", "max_tokens"}
+    if not isinstance(value, dict) or frozenset(value) not in {frozenset(minimal), frozenset(legacy)}:
         raise ValueError("rollout row has unknown or missing fields")
     row_id = value["row_id"]
     if not isinstance(row_id, str) or not _ROW_ID.fullmatch(row_id):
@@ -515,7 +557,7 @@ def _validate_rollout_row(value: Any, *, max_output_tokens: int, vocab_size: int
     if not isinstance(tokens, list):
         raise ValueError(f"rollout {row_id!r} tokens must be a list")
     # The miner does not define its own generation or termination limit. Both
-    # scoring and auditing use this same protocol-owned 32K prefix.
+    # scoring and auditing use this same protocol-owned 2K prefix.
     tokens = tokens[:max_output_tokens]
     for token in tokens:
         if isinstance(token, bool) or not isinstance(token, int) or token < 0:
@@ -618,7 +660,8 @@ def validate_rollout_bundle(
     rows = load_rollouts_strict(
         rollout_path,
         expected_row_ids=expected_row_ids,
-        max_output_tokens=config.max_output_tokens,
+        max_output_tokens=manifest.max_output_tokens,
         vocab_size=vocab_size,
     )
     return manifest, rows
+

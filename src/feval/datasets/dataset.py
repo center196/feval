@@ -8,8 +8,8 @@ import re
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-from .config import NetworkConfig
-from .constants import (
+from ..core.config import NetworkConfig
+from ..core.constants import (
     BASE_MODEL,
     CANDIDATE_POOL_ROWS_PER_TASK,
     INSTRUCTION_DATASET,
@@ -17,11 +17,11 @@ from .constants import (
     MAX_PROMPT_CHARS,
     SUBNET_NETUID,
 )
-from .crypto import hash_json
-from .jsonutil import write_json, write_jsonl
-from .merkle import root_for_values
+from ..utils.crypto import hash_json
+from ..utils.jsonutil import write_json, write_jsonl
+from ..protocol.merkle import root_for_values
 from .rewards import canonical_numeric_answer
-from .schedule import evaluation_seed
+from ..protocol.schedule import evaluation_seed
 
 
 DEFAULT_SPLIT = "train"
@@ -50,6 +50,7 @@ SUPPORTED_INSTRUCTION_IDS = {
     "length_constraints:number_sentences",
     "length_constraints:number_words",
     "length_constraints:nth_paragraph_first_word",
+    "paragraphs:paragraphs",
     "paragraphs:paragraphs2",
     "punctuation:no_comma",
     "punctuation:punctuation_dot",
@@ -82,6 +83,7 @@ REQUIRED_CONSTRAINT_FIELDS = {
     "length_constraints:number_sentences": ("num_sentences", "N"),
     "length_constraints:number_words": ("num_words", "N"),
     "length_constraints:nth_paragraph_first_word": ("num_paragraphs", "nth_paragraph", "first_word"),
+    "paragraphs:paragraphs": (),
     "paragraphs:paragraphs2": (),
     "punctuation:no_comma": (),
     "punctuation:punctuation_dot": (),
@@ -92,7 +94,15 @@ REQUIRED_CONSTRAINT_FIELDS = {
 
 SOURCE_COLUMNS = {
     MATH_DATASET: ["uuid", "problem", "expected_answer", "source", "license", "subset"],
-    INSTRUCTION_DATASET: ["id", "prompt", "instruction_id_list", "kwargs"],
+    INSTRUCTION_DATASET: [
+        "id",
+        "prompt",
+        "instruction_id_list",
+        "kwargs",
+        "grading_mode",
+        "responses_create_params",
+        "verifier_metadata",
+    ],
 }
 
 DIRECT_JSONL_FILES = {
@@ -180,8 +190,7 @@ def _load_huggingface(
         except ImportError as exc:
             raise RuntimeError(
                 "Hugging Face loading requires the 'huggingface-hub' package. "
-                "Install it on the miner/validator image or pass a local export with "
-                "--instruction-input-file."
+                "Install the pinned project dependencies on the miner/validator host."
             ) from exc
         local_path = hf_hub_download(
             repo_id=dataset_name,
@@ -211,8 +220,7 @@ def _load_huggingface(
     except ImportError as exc:
         raise RuntimeError(
             "Hugging Face loading requires the optional 'datasets' package. "
-            "Install it on the miner/validator image or pass local exports with "
-            "--math-input-file and --instruction-input-file."
+            "Install the pinned project dependencies on the miner/validator host."
         ) from exc
     columns = SOURCE_COLUMNS.get(dataset_name)
     load_kwargs: dict[str, Any] = {
@@ -222,8 +230,8 @@ def _load_huggingface(
     }
     if columns:
         # Parquet projection avoids downloading/decoding large nested columns
-        # that are irrelevant for Feval row selection and can trigger
-        # pyarrow list-offset errors.
+        # that are irrelevant for Feval row selection and have triggered
+        # pyarrow list-offset errors in the wild.
         load_kwargs["columns"] = columns
     try:
         stream = load_dataset(dataset_name, **load_kwargs)
@@ -295,9 +303,20 @@ def normalize_math_row(row: dict[str, Any], index: int, max_prompt_chars: int) -
     }
 
 
+def _instruction_metadata(row: dict[str, Any]) -> dict[str, Any]:
+    """Read NVIDIA's current nested schema and its legacy top-level schema."""
+
+    nested = _as_dict(row.get("verifier_metadata"))
+    return {
+        name: nested.get(name, row.get(name))
+        for name in ("instruction_id_list", "prompt", "kwargs", "grading_mode")
+    }
+
+
 def _constraint_specs(row: dict[str, Any]) -> list[dict[str, Any]]:
-    ids = [str(item) for item in _as_list(row.get("instruction_id_list")) if item]
-    kwargs_list = _as_list(row.get("kwargs"))
+    metadata = _instruction_metadata(row)
+    ids = [str(item) for item in _as_list(metadata.get("instruction_id_list")) if item]
+    kwargs_list = _as_list(metadata.get("kwargs"))
     specs: list[dict[str, Any]] = []
     for index, instruction_id in enumerate(ids):
         params = _as_dict(kwargs_list[index]) if index < len(kwargs_list) else {}
@@ -311,13 +330,17 @@ def _constraint_specs(row: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def normalize_instruction_row(row: dict[str, Any], index: int, max_prompt_chars: int) -> dict[str, Any] | None:
-    prompt = _message_prompt(row)
+    metadata = _instruction_metadata(row)
+    prompt = _message_prompt(row) or str(metadata.get("prompt") or "").strip()
     if not prompt or len(prompt) > max_prompt_chars:
         return None
     if suspicious_prompt(prompt):
         return None
     constraints = _constraint_specs(row)
     if not constraints:
+        return None
+    grading_mode = str(metadata.get("grading_mode") or "binary")
+    if grading_mode != "binary":
         return None
     row_id = str(row.get("id") or row.get("uuid") or f"instruction-{index}")
     return {
@@ -510,8 +533,8 @@ def prepare_window_from_config(
     instruction_input_file: str | Path | None = None,
     scan_limit: int | None = None,
 ) -> dict[str, Any]:
-    # Dataset snapshots must be immutable before the pool root is recorded.
-    # Other network invariants are checked by miner and validator commands.
+    # Every miner and validator derives the same window from immutable dataset
+    # snapshots and code-pinned protocol rules.
     config.validate()
     for revision in (config.math_revision, config.instruction_revision):
         if len(revision) != 40 or any(character not in "0123456789abcdef" for character in revision):
@@ -554,8 +577,8 @@ def prepare_candidate_pool_from_config(
 ) -> dict[str, Any]:
     """Build the version-pinned, security-filtered pool once per validator."""
 
-    # The pool root is stored in the canonical sealed network configuration and
-    # verified whenever an evaluation window is derived.
+    # Every participant independently derives this pool from immutable source
+    # snapshots. The resulting root is useful for cross-validator comparison.
     config.validate(production=False)
     pool_seed = hashlib.sha256(
         (
@@ -608,11 +631,6 @@ def prepare_window_from_pool(
         raise ValueError("candidate pool manifest has the wrong kind")
     if pool_manifest.get("evaluation_root") != root_for_values(pool_rows):
         raise ValueError("candidate pool root does not match its rows")
-    if (
-        config.candidate_pool_root is not None
-        and pool_manifest.get("evaluation_root") != config.candidate_pool_root
-    ):
-        raise ValueError("candidate pool root differs from the sealed network config")
     expected_revisions = {
         "math": config.math_revision,
         "instruction_follow": config.instruction_revision,
@@ -658,5 +676,6 @@ def prepare_window_from_pool(
     }
     write_json(manifest_path, manifest)
     return manifest
+
 
 

@@ -10,31 +10,31 @@ import urllib.request
 from pathlib import Path
 
 from ..chain import publish_commitment, serve_axon, set_weights
-from ..config import NetworkConfig, load_network_config
-from ..constants import DEFAULT_ROLLOUT_BATCH_SIZE, MAX_PROMPT_CHARS
-from ..crypto import write_key
-from ..dataset import (
+from ..core.config import NetworkConfig, load_network_config
+from ..core.constants import DEFAULT_ROLLOUT_BATCH_SIZE, MAX_PROMPT_CHARS
+from ..utils.crypto import write_key
+from ..datasets.dataset import (
     DEFAULT_SPLIT,
     INSTRUCTION_DATASET,
     MATH_DATASET,
     prepare_combined_eval,
     prepare_candidate_pool_from_config,
 )
-from ..jsonutil import write_json
-from ..ops import check_health
+from ..utils.jsonutil import write_json
+from ..utils.ops import check_health
 from ..protocol import build_submission, create_demo_files, train_mock_adapter
-from ..results import (
+from ..nodes.results import (
     download_wandb_results,
+    discover_running_wandb_results,
     export_results_bundle,
-    leaderboard,
     log_results_to_wandb,
     miner_result,
     verify_results_bundle,
 )
-from ..runtime import MinerRolloutRunner, ValidatorRunner, publish_miner_model, publish_miner_rollouts
-from ..random_lora import DEFAULT_RANDOM_TARGET_MODULES, write_random_lora
-from ..ui import FevalHelpFormatter, banner, fail, print_table
-from ..validator import audit_submission, promote_candidate, score_submission, write_weights
+from ..nodes import MinerRolloutRunner, ValidatorRunner, publish_miner_model, publish_miner_rollouts
+from ..models.random_lora import DEFAULT_RANDOM_TARGET_MODULES, write_random_lora
+from ..utils.ui import FevalHelpFormatter, banner, fail, print_rows_table, print_table
+from ..nodes.validator import audit_submission, promote_candidate, score_submission, write_weights
 
 
 def _print_result(title: str, value: dict) -> None:
@@ -128,17 +128,6 @@ def cmd_dataset_candidate_pool(args: argparse.Namespace) -> None:
             "out": args.out,
             "manifest": args.manifest,
         }
-        if args.sealed_config_out:
-            if args.history_start_block is None:
-                fail("--history-start-block is required with --sealed-config-out")
-            value = config.to_dict()
-            value["candidate_pool_root"] = manifest["evaluation_root"]
-            value["history_start_block"] = int(args.history_start_block)
-            sealed = NetworkConfig.from_dict(value)
-            sealed.validate(production=True)
-            write_json(args.sealed_config_out, sealed.to_dict())
-            result["sealed_config"] = args.sealed_config_out
-            result["history_start_block"] = int(args.history_start_block)
         _print_result("prepared candidate pool", result)
     except Exception as exc:
         fail(str(exc))
@@ -164,7 +153,7 @@ def cmd_miner_serve(args: argparse.Namespace) -> None:
     directory = Path(args.dir).resolve()
     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(directory))
     with socketserver.ThreadingTCPServer((args.host, args.port), handler) as server:
-        print(f"serving miner artifacts from {directory} at http://{args.host}:{args.port}")
+        print(f"hosting miner artifacts from {directory} at http://{args.host}:{args.port}")
         server.serve_forever()
 
 
@@ -210,9 +199,6 @@ def cmd_miner_rollout(args: argparse.Namespace) -> None:
             wallet_path=args.wallet_path,
             work_dir=args.work_dir,
             batch_size=args.batch_size,
-            scan_limit=args.scan_limit,
-            math_input_file=args.math_input_file,
-            instruction_input_file=args.instruction_input_file,
             hf_token=_hf_token_from_env(),
         )
     except Exception as exc:
@@ -234,9 +220,6 @@ def cmd_miner_watch_rollouts(args: argparse.Namespace) -> None:
             work_dir=args.work_dir,
             batch_size=args.batch_size,
             poll_seconds=args.poll_seconds,
-            scan_limit=args.scan_limit,
-            math_input_file=args.math_input_file,
-            instruction_input_file=args.instruction_input_file,
             hf_token=_hf_token_from_env(),
         )
         if args.once:
@@ -311,12 +294,18 @@ def cmd_miner_status(args: argparse.Namespace) -> None:
             "hotkey": result["hotkey"],
             "uid": result.get("uid"),
             "status": result.get("status"),
+            "audit_status": result.get("audit_status"),
             "valid": result.get("valid"),
             "score": result.get("score"),
             "final_weight": result.get("final_weight"),
             "model_digest": result.get("model_digest"),
             "rollout_revision": result.get("rollout_revision"),
             "audited_count": result.get("audited_count"),
+            "audit_round": result.get("audit_round"),
+            "audit_required_rounds": result.get("audit_required_rounds"),
+            "audit_total_rounds": result.get("audit_total_rounds"),
+            "audit_exact_match_ratio": result.get("audit_exact_match_ratio"),
+            "audit_block": result.get("audit_block"),
             "error": result.get("error"),
         },
     )
@@ -324,25 +313,103 @@ def cmd_miner_status(args: argparse.Namespace) -> None:
 
 def cmd_miner_leaderboard(args: argparse.Namespace) -> None:
     try:
-        results_dir = _results_dir_from_args(args)
-        _check_expected_summary_root(args, results_dir)
-        rows = leaderboard(results_dir, limit=args.limit)
+        result_dirs = list(args.results_dir or [])
+        artifacts = list(args.wandb_artifact or [])
+        if result_dirs and artifacts:
+            fail("pass --results-dir or --wandb-artifact, not both")
+        if not result_dirs and not artifacts:
+            artifacts = discover_running_wandb_results(
+                project=args.wandb_project,
+                entity=args.wandb_entity,
+            )
+            if not artifacts:
+                fail("no running Feval validator result jobs were found in W&B")
+        if artifacts:
+            cache_root = Path(args.cache_dir or ".feval-results")
+            result_dirs = []
+            for index, artifact in enumerate(artifacts, start=1):
+                report = download_wandb_results(
+                    artifact=artifact,
+                    out_dir=cache_root / f"validator-{index}",
+                )
+                result_dirs.append(str(report["out_dir"]))
+        expected_roots = list(args.expected_summary_root or [])
+        if expected_roots and len(expected_roots) != len(result_dirs):
+            fail("pass one --expected-summary-root for each validator result source")
+        views = []
+        used_labels: set[str] = set()
+        for index, result_dir in enumerate(result_dirs, start=1):
+            manifest, rows, _board = verify_results_bundle(result_dir)
+            if expected_roots and manifest.get("summary_root") != expected_roots[index - 1]:
+                fail(f"validator {index} summary root does not match --expected-summary-root")
+            base_label = str(manifest.get("validator_hotkey") or f"validator-{index}")
+            label = base_label if len(base_label) <= 14 else f"{base_label[:7]}...{base_label[-4:]}"
+            if label in used_labels:
+                label = f"{label}#{index}"
+            used_labels.add(label)
+            views.append((label, {str(row["hotkey"]): row for row in rows}))
     except Exception as exc:
         fail(str(exc))
-    for row in rows:
-        _print_result(
-            f"rank {row['rank']}",
-            {
-                "hotkey": row["hotkey"],
-                "uid": row.get("uid"),
-                "status": row.get("status"),
-                "valid": row.get("valid"),
-                "score": row.get("score"),
-                "final_weight": row.get("final_weight"),
-                "model_digest": row.get("model_digest"),
-                "error": row.get("error"),
-            },
+
+    def result_cell(row: dict | None) -> str:
+        if row is None:
+            return "-"
+        score = float(row.get("score") or 0.0)
+        if float(row.get("final_weight") or 0.0) > 0.0:
+            return f"KING {score:.4f}"
+        if row.get("valid"):
+            return f"VALID {score:.4f}"
+        status = str(row.get("audit_status") or row.get("status") or "invalid").lower()
+        if status == "auditing":
+            return f"AUDIT {int(row.get('audit_round') or 0)}/{int(row.get('audit_total_rounds') or 20)}"
+        if status == "retrying":
+            return f"RETRY {int(row.get('audit_round') or 0)}/{int(row.get('audit_total_rounds') or 20)}"
+        if status == "blacklisted":
+            return "BLACKLIST"
+        return "INVALID"
+
+    miners = sorted({hotkey for _label, rows in views for hotkey in rows})
+
+    def order_key(hotkey: str):
+        miner_rows = [rows.get(hotkey) for _label, rows in views]
+        king_count = sum(
+            float(row.get("final_weight") or 0.0) > 0.0
+            for row in miner_rows
+            if row is not None
         )
+        valid_rows = [row for row in miner_rows if row is not None and row.get("valid")]
+        mean_score = (
+            sum(float(row.get("score") or 0.0) for row in valid_rows) / len(valid_rows)
+            if valid_rows
+            else 0.0
+        )
+        return (-king_count, -len(valid_rows), -mean_score, hotkey)
+
+    miners.sort(key=order_key)
+    miners = miners[: args.limit]
+    table_rows = []
+    for rank, hotkey in enumerate(miners, start=1):
+        available = [rows[hotkey] for _label, rows in views if hotkey in rows]
+        uid = next((row.get("uid") for row in available if row.get("uid") is not None), None)
+        table_row = {
+            "rank": rank,
+            "miner": hotkey if len(hotkey) <= 20 else f"{hotkey[:8]}...{hotkey[-6:]}",
+            "uid": uid,
+        }
+        for index, (_label, rows) in enumerate(views):
+            table_row[f"validator_{index}"] = result_cell(rows.get(hotkey))
+        table_rows.append(table_row)
+    columns = [
+        ("rank", "RANK", "right"),
+        ("uid", "UID", "right"),
+        ("miner", "MINER", "left"),
+        *[
+            (f"validator_{index}", label, "left")
+            for index, (label, _rows) in enumerate(views)
+        ],
+    ]
+    print_rows_table("Feval validator leaderboard", columns, table_rows)
+    print("  KING=rewarded  VALID=eligible  AUDIT=collecting rounds  INVALID=failed")
 
 
 def cmd_validator_fetch(args: argparse.Namespace) -> None:
@@ -359,7 +426,7 @@ def cmd_validator_score(args: argparse.Namespace) -> None:
 
 
 def cmd_validator_audit(args: argparse.Namespace) -> None:
-    report = audit_submission(args.config, args.eval, args.submission, args.out, args.seed, args.rows, args.keyring, args.backend_command)
+    report = audit_submission(args.config, args.eval, args.submission, args.out, args.seed, args.rows, args.keyring)
     _print_result("wrote audit report", {"miner_hotkey": report["miner_hotkey"], "valid": report["valid"], "audited": len(report["audited_rows"]), "out": args.out})
 
 
@@ -369,7 +436,7 @@ def cmd_validator_promote(args: argparse.Namespace) -> None:
     _print_result("updated champion state", {
         "promoted": decision["promoted"],
         "reason": decision["reason"],
-        "current_king": state.get("champions", [{}])[0].get("owner_hotkey"),
+        "current_king": state.get("champions", [{}])[0].get("miner_hotkey"),
         "out": args.out,
     })
 
@@ -394,10 +461,7 @@ def cmd_validator_run(args: argparse.Namespace) -> None:
             work_dir=args.work_dir,
             state_path=args.state,
             dry_run_weights=args.dry_run_weights,
-            scan_limit=args.scan_limit,
             poll_seconds=args.poll_seconds,
-            math_input_file=args.math_input_file,
-            instruction_input_file=args.instruction_input_file,
         )
         if args.once:
             with runner.process_lock():
@@ -564,7 +628,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.set_defaults(func=cmd_dataset_prepare)
     candidate_pool = dataset_sub.add_parser(
         "candidate-pool",
-        help="Build the canonical launch candidate pool and print its root.",
+        help="Independently derive the deterministic candidate pool and print its root.",
         formatter_class=FevalHelpFormatter,
     )
     candidate_pool.add_argument("--config", default="network.json")
@@ -573,8 +637,6 @@ def build_parser() -> argparse.ArgumentParser:
     candidate_pool.add_argument("--scan-limit", type=int, help="Maximum raw rows to scan before filtering.")
     candidate_pool.add_argument("--out", required=True)
     candidate_pool.add_argument("--manifest", required=True)
-    candidate_pool.add_argument("--sealed-config-out", help="Write a sealed network config for miners and validators.")
-    candidate_pool.add_argument("--history-start-block", type=int, help="Launch block to seal into --sealed-config-out.")
     candidate_pool.set_defaults(func=cmd_dataset_candidate_pool)
 
     miner = sub.add_parser("miner", help="Miner commands.", formatter_class=FevalHelpFormatter)
@@ -595,11 +657,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Read the public validator leaderboard summary.",
         formatter_class=FevalHelpFormatter,
     )
-    board.add_argument("--results-dir")
-    board.add_argument("--wandb-artifact")
+    board.add_argument("--results-dir", action="append")
+    board.add_argument("--wandb-artifact", action="append")
     board.add_argument("--cache-dir")
+    board.add_argument(
+        "--wandb-project",
+        default=os.environ.get("WANDB_PROJECT", "feval-subnet-47"),
+        help="W&B project used for automatic running-validator discovery.",
+    )
+    board.add_argument(
+        "--wandb-entity",
+        default=os.environ.get("WANDB_ENTITY") or None,
+        help="W&B entity used for discovery. Defaults to the logged-in account.",
+    )
     board.add_argument("--limit", type=int, default=20)
-    board.add_argument("--expected-summary-root")
+    board.add_argument("--expected-summary-root", action="append")
     board.set_defaults(func=cmd_miner_leaderboard)
     publish_model = miner_sub.add_parser(
         "publish-model",
@@ -621,7 +693,7 @@ def build_parser() -> argparse.ArgumentParser:
     publish_model.set_defaults(func=cmd_miner_publish_model)
     random_lora = miner_sub.add_parser(
         "random-lora",
-        help="Create a random valid LoRA adapter for submit-path testing.",
+        help="Create a seeded zero-effect LoRA adapter for submit-path testing.",
         formatter_class=FevalHelpFormatter,
     )
     random_lora.add_argument("--config", help="Optional network config. Defaults to Feval subnet 47 constants.")
@@ -631,12 +703,17 @@ def build_parser() -> argparse.ArgumentParser:
     random_lora.add_argument("--target-modules", nargs="+", default=list(DEFAULT_RANDOM_TARGET_MODULES))
     random_lora.add_argument("--layers", type=int, help="Defaults to all base-model layers.")
     random_lora.add_argument("--seed", type=int, default=0)
-    random_lora.add_argument("--scale", type=float, default=0.01)
+    random_lora.add_argument(
+        "--scale",
+        type=float,
+        default=0.01,
+        help="Scale for seeded random A tensors; B is zero, so model output is unchanged.",
+    )
     random_lora.set_defaults(func=cmd_miner_random_lora)
     rollout = miner_sub.add_parser(
         "rollout",
         help=(
-            "Run deterministic vLLM inference for the current 32-row evaluation window and update "
+            "Run greedy vLLM inference for the current 10,000-row window and update "
             "the Hugging Face rollout dataset repo from this hotkey's on-chain model commitment."
         ),
         formatter_class=FevalHelpFormatter,
@@ -652,11 +729,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--batch-size",
         type=int,
         default=DEFAULT_ROLLOUT_BATCH_SIZE,
-        help="Outer prompts per vLLM submission. Raise on large GPUs, lower if memory is tight.",
+        help="Maximum active vLLM sequences. Raise on large GPUs, lower if memory is tight.",
     )
-    rollout.add_argument("--scan-limit", type=int)
-    rollout.add_argument("--math-input-file")
-    rollout.add_argument("--instruction-input-file")
     _add_runtime_wallet_args(rollout)
     rollout.set_defaults(func=cmd_miner_rollout)
     watch_rollouts = miner_sub.add_parser(
@@ -678,14 +752,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--batch-size",
         type=int,
         default=DEFAULT_ROLLOUT_BATCH_SIZE,
-        help="Outer prompts per vLLM submission. Raise on large GPUs, lower if memory is tight.",
+        help="Maximum active vLLM sequences. Raise on large GPUs, lower if memory is tight.",
     )
     watch_rollouts.add_argument("--poll-seconds", type=int, default=60)
     watch_rollouts.add_argument("--once", action="store_true", help="Check the current window once and exit.")
     watch_rollouts.add_argument("--force", action="store_true", help="With --once, regenerate even if this model/window was already uploaded.")
-    watch_rollouts.add_argument("--scan-limit", type=int)
-    watch_rollouts.add_argument("--math-input-file")
-    watch_rollouts.add_argument("--instruction-input-file")
     _add_runtime_wallet_args(watch_rollouts)
     watch_rollouts.set_defaults(func=cmd_miner_watch_rollouts)
 
@@ -710,9 +781,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Seconds between validator cycles. Defaults to the protocol audit interval.",
     )
     run.add_argument("--dry-run-weights", action="store_true")
-    run.add_argument("--scan-limit", type=int)
-    run.add_argument("--math-input-file")
-    run.add_argument("--instruction-input-file")
     _add_runtime_wallet_args(run)
     run.set_defaults(func=cmd_validator_run)
     sync_history = validator_sub.add_parser(
@@ -757,7 +825,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     dev_sub = dev.add_subparsers(dest="dev_command", required=True)
     demo = dev_sub.add_parser(
-        "demo", help="Generate local deterministic miner and validator fixtures.", formatter_class=FevalHelpFormatter
+        "demo", help="Run the local mock miner/validator smoke test.", formatter_class=FevalHelpFormatter
     )
     demo.add_argument("--out", required=True)
     demo.add_argument("--clean", action="store_true")
@@ -789,5 +857,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
 

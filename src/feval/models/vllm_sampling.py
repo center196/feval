@@ -6,8 +6,8 @@ import torch
 from vllm import SamplingParams
 from vllm.v1.sample.logits_processor import BatchUpdate, LogitsProcessor, process_dict_updates
 
-from .canonical import HASH_PRIME, canonical_max_logprob_gap, canonical_row_coefficients
-from .constants import CANONICAL_MAX_CANDIDATES, CANONICAL_MIN_RELATIVE_PROBABILITY
+from ..protocol.canonical import HASH_PRIME, canonical_max_logprob_gap, canonical_row_coefficients
+from ..core.constants import CANONICAL_MAX_CANDIDATES, CANONICAL_MIN_RELATIVE_PROBABILITY
 
 
 EXTRA_ARG = "feval_canonical"
@@ -88,3 +88,4 @@ class CanonicalNearMaxLogitsProcessor(LogitsProcessor):
         logits[self._indices] = -float("inf")
         logits[self._indices, selected_ids] = 0.0
         return logits
+

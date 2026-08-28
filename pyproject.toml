@@ -14,17 +14,17 @@ dependencies = [
   "safetensors==0.8.0",
   "transformers==5.15.0",
   "vllm==0.27.1; platform_system == 'Linux'",
+  "wandb>=0.17,<1",
 ]
-
-[project.optional-dependencies]
-dev = ["pytest>=8,<10"]
-wandb = ["wandb>=0.17,<1"]
 
 [project.scripts]
 feval = "feval.cli.main:main"
 
+[tool.setuptools]
+package-dir = {"" = "src"}
+
 [tool.setuptools.packages.find]
-where = ["."]
+where = ["src"]
 include = ["feval*"]
 
 

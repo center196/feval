@@ -4,7 +4,7 @@ import hashlib
 import math
 from collections.abc import Iterable
 
-from .jsonutil import canonical_json_bytes
+from ..utils.jsonutil import canonical_json_bytes
 
 
 HASH_PRIME = 2_147_483_647
@@ -55,3 +55,4 @@ def canonical_token_choice(
         candidates,
         key=lambda token_id: ((token_id * multiplier + offset) % HASH_PRIME, token_id),
     )
+
