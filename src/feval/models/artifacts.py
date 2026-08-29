@@ -172,7 +172,10 @@ class RolloutManifest:
 
     def validate(self, config: NetworkConfig) -> None:
         if self.protocol != PROTOCOL_ROLLOUT_MANIFEST:
-            raise ValueError("unsupported rollout manifest protocol")
+            raise ValueError(
+                f"unsupported rollout manifest protocol {self.protocol!r}; "
+                f"expected {PROTOCOL_ROLLOUT_MANIFEST!r}"
+            )
         if not self.miner_hotkey or len(self.miner_hotkey) > 128:
             raise ValueError("invalid miner hotkey")
         validate_repo_id(self.model_repo)
