@@ -148,11 +148,12 @@ is always capped at 32,768 tokens, so the effective generation budget for each
 row is the smaller of the miner's choice and the context remaining after its
 fixed prompt. A 256 MiB total bundle cap prevents miners from imposing
 multi-gigabyte downloads. Dataset and context changes are manual protocol
-upgrades. Validators score all rows locally, then
-verify unpredictable samples against the committed adapter using exact
-greedy-token checks. Eligibility requires 10 successful rounds of 32 distinct
-rows; auditing continues for 20
-rounds. Validators consider only currently registered miners with valid Feval
+upgrades. Validators score all rows locally, then verify unpredictable samples
+against the committed adapter using bounded
+greedy-token checks. Every token must be within the top three and a 0.25
+logprob gap, while at least 99.5% must be exact rank one. Eligibility requires
+10 successful rounds of 32 distinct rows; auditing continues for 20 rounds.
+Validators consider only currently registered miners with valid Feval
 metadata. Exact model and exact full-rollout copies belong to the earlier
 current commitment block, with the hotkey as a deterministic same-block tie
 breaker. Replacing a commitment or leaving the current miner set removes its

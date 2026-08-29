@@ -246,7 +246,7 @@ def champion_weight_mapping(
     commitments: dict[str, dict[str, Any]],
     copies: dict[str, str],
 ) -> dict[int, float]:
-    """Burn 90% and allocate 10% only to the positive active current king."""
+    """Apply the configured burn and active-champion allocation."""
 
     by_hotkey: dict[str, float] = {}
     for share, champion in zip(config.champion_shares, state.get("champions", [])):

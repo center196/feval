@@ -4,7 +4,13 @@ from pathlib import Path
 from typing import Any
 
 from ..utils.crypto import hash_file, hash_json, sign_payload
-from ..core.constants import BASE_MODEL, BASE_MODEL_REVISION
+from ..core.constants import (
+    BASE_MODEL,
+    BASE_MODEL_REVISION,
+    BURN_SHARE,
+    CHALLENGER_SHARE,
+    CHAMPION_SHARES,
+)
 from ..utils.jsonutil import load_json, load_jsonl, write_json, write_jsonl
 from .merkle import leaf_hash, root_for_values
 from ..models.mock_model import generate_rollout
@@ -26,7 +32,11 @@ def create_demo_files(out_dir: str | Path) -> dict[str, str]:
         "base_hash": hash_json({"base": BASE_MODEL, "revision": BASE_MODEL_REVISION}),
         "reward": {"type": "row_verifier", "numeric_tolerance": 1e-6},
         "promotion": {"delta_min": 0.01, "confidence_z": 2.326347874},
-        "emissions": {"burn_uid_0": 0.90, "current": 0.10, "challengers": 0.0},
+        "emissions": {
+            "burn_uid_0": BURN_SHARE,
+            "current": sum(CHAMPION_SHARES),
+            "challengers": CHALLENGER_SHARE,
+        },
     }
     train_rows = [
         {"row_id": "train-1", "prompt": "2 + 2 =", "expected": ["4"], "task_type": "math", "verifier": "exact_or_numeric"},

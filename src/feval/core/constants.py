@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 
-PROTOCOL_NETWORK = "feval-network-v28"
+PROTOCOL_NETWORK = "feval-network-v30"
 PROTOCOL_MODEL_COMMITMENT = "f3"
 PROTOCOL_MODEL_MANIFEST = "feval-model-v4"
 PROTOCOL_ROLLOUT_MANIFEST = "feval-rollouts-v17"
-PROTOCOL_VALIDATOR_STATE = "feval-validator-state-v29"
+PROTOCOL_VALIDATOR_STATE = "feval-validator-state-v30"
 PROTOCOL_MINER_ROLLOUT_STATE = "feval-miner-rollout-state-v14"
 
 SUBNET_NETUID = 47
@@ -14,8 +14,8 @@ PUBLIC_WANDB_PROJECT = "feval-valid"
 CHAMPION_COUNT = 1
 PROMOTION_DELTA_MIN = 0.01
 PROMOTION_CONFIDENCE_Z = 2.326347874
-CHAMPION_SHARES = (0.10,)
-BURN_SHARE = 0.90
+CHAMPION_SHARES = (0.01,)
+BURN_SHARE = 0.99
 CHALLENGER_SHARE = 0.0
 INVALID_ROUNDS_BEFORE_BLACKLIST = 3
 BLACKLIST_ENABLED = False
@@ -62,11 +62,12 @@ AUDIT_DETECTION_CONFIDENCE = 0.95
 # auditing that exact immutable revision until twenty rounds have passed so
 # eligibility is not also the end of ongoing fraud detection.
 AUDIT_TOTAL_ROUNDS = 20
-# Miners decode greedily, so every audited token must be the exact rank-one
-# token under the committed adapter. A merely plausible near-top token does
-# not prove that the submitted trace is the model's greedy rollout.
-AUDIT_MIN_RELATIVE_PROBABILITY = 1.0
-AUDIT_MIN_EXACT_ARGMAX_RATIO = 1.0
+# BF16 decode and teacher-forced kernels can reorder a few close logits across
+# supported GPUs. Bound that numerical tolerance while requiring almost every
+# audited token to remain the exact rank-one choice.
+AUDIT_MAX_TOKEN_RANK = 3
+AUDIT_MIN_RELATIVE_PROBABILITY = 0.7788007830714049  # exp(-0.25)
+AUDIT_MIN_EXACT_ARGMAX_RATIO = 0.995
 # Validator audit memory profile. Keep one active audit sequence and chunk
 # prompt-logprob work so several maximum-length traces cannot accumulate their
 # KV caches concurrently.

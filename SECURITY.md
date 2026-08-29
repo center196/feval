@@ -49,10 +49,11 @@ code-pinned 32,768-token combined prompt-and-response context. After a future
 finalized block makes the sample unpredictable, validators teacher-force 32
 distinct rows per round through the committed adapter. The 256 MiB aggregate
 bundle cap prevents miners from turning flexible generation budgets into an
-unbounded download. Every submitted token must equal a rank-one token. Ten
-successful rounds cover 320 distinct rows before eligibility; twenty rounds
-continue monitoring the same
-immutable revision. With 100 forged rows among 10,000, 320 samples without
+unbounded download. Every submitted token must rank within the top three and
+remain within a 0.25 logprob gap; at least 99.5% of audited tokens must still
+be exact rank one. Ten successful rounds cover 320 distinct rows before
+eligibility; twenty rounds continue monitoring the same immutable revision.
+With 100 forged rows among 10,000, 320 samples without
 replacement detect at least one with probability 96.19%.
 
 This is strong statistical evidence that the sampled traces are greedy outputs
@@ -74,7 +75,7 @@ otherwise the row must consume its prompt-adjusted budget.
 
 Dataset repository names and full revisions are constants in source code.
 Production miner and validator commands expose no local dataset path, scan
-limit, or output-cap override. Changing a dataset or verifier requires a
+limit, or protocol context-cap override. Changing a dataset or verifier requires a
 reviewed protocol release adopted by validators and miners.
 
 The math verifier intentionally accepts only complete, strictly parsed integer,
@@ -98,22 +99,22 @@ the hotkey breaks a same-block tie deterministically. Replacing a commitment or
 leaving the current miner set removes that priority. Validators do not require
 historical block scans or an archive RPC endpoint.
 
-Only the positive-scoring active king receives miner emission: 10% to that UID
-and 90% to burn UID 0. With no eligible king, UID 0 receives 100%. Promotion
+Only the positive-scoring active king receives miner emission: 1% to that UID
+and 99% to burn UID 0. With no eligible king, UID 0 receives 100%. Promotion
 requires the configured statistical lower bound to clear the 1% margin.
 
 ## Resource limits and residual risks
 
 - Adapters are limited to 256 MiB. Rollouts are limited to 256 MiB total and
-  32 KiB per JSONL row; manifests and adapter JSON are limited to 64 KiB.
+  256 KiB per JSONL row; manifests and adapter JSON are limited to 64 KiB.
 - Audit inference uses one active sequence, a 60% GPU-memory target, and
   4,096-token prompt-logprob chunks. Operators must still enforce container
   memory, disk, CPU, GPU, process, and wall-time limits.
 - A miner can cause downloads and failed validation attempts. Rate limiting,
   outbound allowlists, cache quotas, and monitoring remain operator duties.
-- Exact rank-one comparisons can differ at numerical ties across GPU/runtime
-  combinations. Qualify and pin one supported hardware/software stack before
-  mainnet use; a mismatch fails closed rather than granting a score.
+- BF16 comparisons can differ across GPU/runtime combinations. The bounded
+  rank/gap tolerance handles small numerical reorderings while the 99.5%
+  exact-rank requirement fails broader divergence closed.
 - Regex/counting instruction predicates have semantic edge cases. Version and
   fuzz-test every verifier change.
 - Hub, chain RPC, disk, or GPU outages can delay evaluation. They do

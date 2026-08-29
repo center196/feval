@@ -7,6 +7,7 @@ from typing import Any
 from .constants import (
     AUDIT_DETECTION_CONFIDENCE,
     AUDIT_DELAY_BLOCKS,
+    AUDIT_MAX_TOKEN_RANK,
     AUDIT_MIN_EXACT_ARGMAX_RATIO,
     AUDIT_MIN_FAKE_ROW_FRACTION,
     AUDIT_MIN_RELATIVE_PROBABILITY,
@@ -63,6 +64,7 @@ class NetworkConfig:
     audit_min_fake_row_fraction: float = AUDIT_MIN_FAKE_ROW_FRACTION
     audit_detection_confidence: float = AUDIT_DETECTION_CONFIDENCE
     audit_total_rounds: int = AUDIT_TOTAL_ROUNDS
+    audit_max_token_rank: int = AUDIT_MAX_TOKEN_RANK
     audit_min_relative_probability: float = AUDIT_MIN_RELATIVE_PROBABILITY
     audit_min_exact_argmax_ratio: float = AUDIT_MIN_EXACT_ARGMAX_RATIO
     audit_interval_seconds: int = 420
@@ -132,6 +134,14 @@ class NetworkConfig:
             raise ValueError(
                 f"this protocol requires audit_total_rounds={AUDIT_TOTAL_ROUNDS}"
             )
+        if (
+            isinstance(self.audit_max_token_rank, bool)
+            or not isinstance(self.audit_max_token_rank, int)
+            or self.audit_max_token_rank != AUDIT_MAX_TOKEN_RANK
+        ):
+            raise ValueError(
+                f"this protocol requires audit_max_token_rank={AUDIT_MAX_TOKEN_RANK}"
+            )
         if self.audit_min_relative_probability != AUDIT_MIN_RELATIVE_PROBABILITY:
             raise ValueError(
                 "this protocol requires audit_min_relative_probability="
@@ -150,6 +160,7 @@ class NetworkConfig:
             "audit_delay_blocks",
             "audit_rows_per_round",
             "audit_total_rounds",
+            "audit_max_token_rank",
             "max_output_tokens",
             "max_context_tokens",
         ):
@@ -228,6 +239,8 @@ class NetworkConfig:
             "feval-network-v25",
             "feval-network-v26",
             "feval-network-v27",
+            "feval-network-v28",
+            "feval-network-v29",
         }:
             # Operational compatibility for previously sealed configurations. All
             # code-pinned evaluation and audit-size fields take their current
@@ -242,9 +255,9 @@ class NetworkConfig:
             value["audit_min_fake_row_fraction"] = AUDIT_MIN_FAKE_ROW_FRACTION
             value["audit_detection_confidence"] = AUDIT_DETECTION_CONFIDENCE
             value["audit_total_rounds"] = AUDIT_TOTAL_ROUNDS
+            value["audit_max_token_rank"] = AUDIT_MAX_TOKEN_RANK
             value.pop("canonical_max_candidates", None)
             value.pop("canonical_min_relative_probability", None)
-            value.pop("audit_max_token_rank", None)
             value["audit_min_relative_probability"] = AUDIT_MIN_RELATIVE_PROBABILITY
             value["audit_min_exact_argmax_ratio"] = AUDIT_MIN_EXACT_ARGMAX_RATIO
             value["challenger_share"] = CHALLENGER_SHARE

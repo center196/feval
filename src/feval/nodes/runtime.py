@@ -184,6 +184,7 @@ def _normalize_state(state: Any) -> dict[str, Any]:
         "feval-validator-state-v26",
         "feval-validator-state-v27",
         "feval-validator-state-v28",
+        "feval-validator-state-v29",
     }:
         # Audit semantics changed. Never carry old pass/fail decisions or
         # partial rounds into a different token-validity protocol.
@@ -1267,7 +1268,7 @@ class ValidatorRunner:
                 if failed_audits:
                     failed_conditions.append(
                         f"{len(failed_audits)}/{len(selected_ids)} audited rows "
-                        "failed exact greedy argmax verification"
+                        "failed bounded greedy-token verification"
                     )
                 if exact_match_ratio < self.config.audit_min_exact_argmax_ratio:
                     failed_conditions.append(

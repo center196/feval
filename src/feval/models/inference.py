@@ -671,9 +671,10 @@ def _token_audit(
     position: Any,
     token_id: int,
     *,
+    max_token_rank: int,
     min_relative_probability: float,
 ) -> dict[str, Any]:
-    """Accept only rank-one greedy tokens at the configured probability floor."""
+    """Accept a tightly bounded near-greedy token for BF16 portability."""
 
     invalid = {
         "valid": False,
@@ -696,15 +697,19 @@ def _token_audit(
     candidates.sort(key=lambda candidate: (-candidate[1], candidate[0]))
     top = candidates[0][1]
     gap_limit = -math.log(min_relative_probability)
+    normalized = [
+        (candidate_id, logprob, rank if rank is not None else (1 if index == 0 else None))
+        for index, (candidate_id, logprob, rank) in enumerate(candidates)
+    ]
     accepted = [
         candidate_id
-        for candidate_id, logprob, _rank in candidates
-        if top - logprob <= gap_limit
+        for candidate_id, logprob, rank in normalized
+        if rank is not None
+        and rank <= max_token_rank
+        and top - logprob <= gap_limit + 1e-6
     ]
-    submitted = next((item for item in candidates if item[0] == token_id), None)
+    submitted = next((item for item in normalized if item[0] == token_id), None)
     rank = None if submitted is None else submitted[2]
-    if submitted is not None and rank is None:
-        rank = candidates.index(submitted) + 1
     gap = None if submitted is None else max(0.0, top - submitted[1])
     return {
         "valid": token_id in accepted,
@@ -852,6 +857,7 @@ class VllmAuditEngine:
                     _token_audit(
                         position_data,
                         token_id,
+                        max_token_rank=self.config.audit_max_token_rank,
                         min_relative_probability=self.config.audit_min_relative_probability,
                     )
                 )
@@ -870,7 +876,7 @@ class VllmAuditEngine:
                     "row_id": source["row_id"],
                     "valid": failure_position is None,
                     "failure_position": failure_position,
-                    "failure_reason": "token_not_greedy_argmax" if failure_position is not None else None,
+                    "failure_reason": "token_outside_greedy_tolerance" if failure_position is not None else None,
                     "failure_rank": failure_rank,
                     "failure_logprob_gap": failure_logprob_gap,
                     "failure_accepted_token_ids": failure_accepted_token_ids,
