@@ -226,6 +226,8 @@ class NetworkConfig:
             "feval-network-v23",
             "feval-network-v24",
             "feval-network-v25",
+            "feval-network-v26",
+            "feval-network-v27",
         }:
             # Operational compatibility for previously sealed configurations. All
             # code-pinned evaluation and audit-size fields take their current
@@ -255,6 +257,8 @@ class NetworkConfig:
             value["evaluation_rows"] = EVALUATION_ROWS
             value["math_rows"] = MATH_ROWS
             value["instruction_rows"] = INSTRUCTION_ROWS
+            value["max_output_tokens"] = MAX_OUTPUT_TOKENS
+            value["max_context_tokens"] = MAX_CONTEXT_TOKENS
             value.pop("candidate_pool_root", None)
             value.pop("history_start_block", None)
             value.pop("history_batch_blocks", None)

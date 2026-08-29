@@ -79,7 +79,8 @@ feval miner watch-rollouts \
   --config network.json \
   --adapter-dir output/my-lora \
   --work-dir miner-work \
-  --batch-size 16 \
+  --max-new-tokens 32768 \
+  --batch-size 4 \
   --poll-seconds 60 \
   -w <wallet-name> -H <hotkey-name> -n finney
 ```
@@ -140,11 +141,17 @@ At the pinned instruction revision, 16,377 of 46,391 source rows pass the safe
 schema, constraint, and prompt filters, leaving substantial headroom above the
 5,000-row window requirement.
 
-Production commands cannot replace those datasets, reduce the row count, or
-change the fixed 2,048-token output cap. Dataset changes are manual protocol
-upgrades. Validators score all rows locally, then verify unpredictable samples
-against the committed adapter using exact greedy-token checks. Eligibility
-requires 10 successful rounds of 32 distinct rows; auditing continues for 20
+Production commands cannot replace those datasets or reduce the row count.
+Miners select `--max-new-tokens` from 1 through 32,768; validators read the
+rollout manifest and enforce that exact requested limit. Prompt plus response
+is always capped at 32,768 tokens, so the effective generation budget for each
+row is the smaller of the miner's choice and the context remaining after its
+fixed prompt. A 256 MiB total bundle cap prevents miners from imposing
+multi-gigabyte downloads. Dataset and context changes are manual protocol
+upgrades. Validators score all rows locally, then
+verify unpredictable samples against the committed adapter using exact
+greedy-token checks. Eligibility requires 10 successful rounds of 32 distinct
+rows; auditing continues for 20
 rounds. Validators consider only currently registered miners with valid Feval
 metadata. Exact model and exact full-rollout copies belong to the earlier
 current commitment block, with the hotkey as a deterministic same-block tie

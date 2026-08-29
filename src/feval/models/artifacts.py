@@ -188,9 +188,15 @@ class RolloutManifest:
             raise ValueError("rollout base model does not match network config")
         if self.row_count != config.evaluation_rows:
             raise ValueError(f"rollout must contain exactly {config.evaluation_rows} rows")
-        if self.max_output_tokens != config.max_output_tokens:
+        if (
+            isinstance(self.max_output_tokens, bool)
+            or not isinstance(self.max_output_tokens, int)
+            or self.max_output_tokens <= 0
+            or self.max_output_tokens > config.max_output_tokens
+        ):
             raise ValueError(
-                f"rollout generation limit must equal {config.max_output_tokens}"
+                "rollout generation limit must be between 1 and "
+                f"{config.max_output_tokens}"
             )
         if self.dataset_window < 0:
             raise ValueError("dataset window must be non-negative")
@@ -559,9 +565,12 @@ def _validate_rollout_row(value: Any, *, max_output_tokens: int, vocab_size: int
     tokens = value["tokens"]
     if not isinstance(tokens, list):
         raise ValueError(f"rollout {row_id!r} tokens must be a list")
-    # The miner does not define its own generation or termination limit. Both
-    # scoring and auditing use this same protocol-owned 2K prefix.
-    tokens = tokens[:max_output_tokens]
+    # The manifest selects a per-rollout generation cap within the protocol
+    # ceiling. Scoring and auditing use that exact same immutable value.
+    if len(tokens) > max_output_tokens:
+        raise ValueError(
+            f"rollout {row_id!r} exceeds its {max_output_tokens}-token limit"
+        )
     for token in tokens:
         if isinstance(token, bool) or not isinstance(token, int) or token < 0:
             raise ValueError(f"rollout {row_id!r} has an invalid token id")
@@ -618,7 +627,12 @@ def load_rollouts_strict(
     return rows
 
 
-def write_rollouts(path: str | Path, rows: Iterable[dict[str, Any]]) -> str:
+def write_rollouts(
+    path: str | Path,
+    rows: Iterable[dict[str, Any]],
+    *,
+    max_output_tokens: int = MAX_OUTPUT_TOKENS,
+) -> str:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     hasher = hashlib.sha256()
@@ -626,7 +640,7 @@ def write_rollouts(path: str | Path, rows: Iterable[dict[str, Any]]) -> str:
         for row in rows:
             normalized = _validate_rollout_row(
                 row,
-                max_output_tokens=MAX_OUTPUT_TOKENS,
+                max_output_tokens=max_output_tokens,
                 vocab_size=None,
             )
             line = canonical_json_bytes(normalized) + b"\n"

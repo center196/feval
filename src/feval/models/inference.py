@@ -176,10 +176,9 @@ def _new_vllm(
     gpu_memory_utilization: float | None = None,
 ):
     if reserve_output_token:
-        # The pinned Qwen3-4B-Base advertises exactly 32,768 positions. Only
-        # vLLM's ignored mandatory output occupies position 32,769; every
-        # miner-controlled token and every audited log-probability remains
-        # inside the model's native limit. Set this before importing vLLM.
+        # vLLM requires one ignored generated token after the complete
+        # teacher-forced audit sequence. It is not miner controlled and is not
+        # included in any score or audit result.
         os.environ["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
     configure_vllm_environment()
     try:
@@ -406,8 +405,8 @@ def protocol_rollout_tokens(
 ) -> tuple[list[int], list[int]]:
     """Return the single protocol-defined rollout prefix used everywhere.
 
-    Responses are capped by the fixed protocol-owned 2K limit, then further
-    capped by the pinned model context after the fixed prompt.
+    Responses are capped by the miner-selected manifest limit, then further
+    capped by the protocol context after the fixed prompt.
     Per-row miner-provided stop or length metadata is deliberately irrelevant.
     """
 
@@ -416,7 +415,11 @@ def protocol_rollout_tokens(
     available = min(output_limit, config.max_context_tokens - len(prompt_ids))
     if available <= 0:
         raise ValueError("rollout prompt leaves no room under the protocol context limit")
-    bounded = list(tokens[:available])
+    if len(tokens) > available:
+        raise ValueError(
+            "rollout response exceeds the context remaining after its prompt"
+        )
+    bounded = list(tokens)
     stop_ids = set(generation_stop_token_ids(tokenizer))
     if any(token_id in stop_ids for token_id in bounded[:-1]):
         raise ValueError("rollout continues after a protocol terminal token")
@@ -621,7 +624,11 @@ def build_rollout_bundle_vllm(
     )
     root = Path(out_dir)
     root.mkdir(parents=True, exist_ok=True)
-    rows_sha256 = write_rollouts(root / "rollouts.jsonl", rows)
+    rows_sha256 = write_rollouts(
+        root / "rollouts.jsonl",
+        rows,
+        max_output_tokens=output_limit,
+    )
     manifest = RolloutManifest(
         miner_hotkey=miner_hotkey,
         model_repo=commitment.model_repo,

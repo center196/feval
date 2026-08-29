@@ -43,11 +43,15 @@ semantic model digest, and rollout repository. The rollout manifest binds the
 same model to one dataset window, evaluation seed, evaluation Merkle root, and
 the SHA-256 digest of all 10,000 ordered rollout rows.
 
-Generation is deterministic greedy decoding under a fixed 2,048-token output
-cap. After a future finalized block makes the sample unpredictable, validators
-teacher-force 32 distinct rows per round through the committed adapter. Every
-submitted token must equal a rank-one token. Ten successful rounds cover 320
-distinct rows before eligibility; twenty rounds continue monitoring the same
+Generation is deterministic greedy decoding under a miner-selected limit from
+1 through 32,768 tokens. Validators enforce the manifest's exact limit and the
+code-pinned 32,768-token combined prompt-and-response context. After a future
+finalized block makes the sample unpredictable, validators teacher-force 32
+distinct rows per round through the committed adapter. The 256 MiB aggregate
+bundle cap prevents miners from turning flexible generation budgets into an
+unbounded download. Every submitted token must equal a rank-one token. Ten
+successful rounds cover 320 distinct rows before eligibility; twenty rounds
+continue monitoring the same
 immutable revision. With 100 forged rows among 10,000, 320 samples without
 replacement detect at least one with probability 96.19%.
 

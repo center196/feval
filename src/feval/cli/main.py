@@ -11,7 +11,7 @@ from pathlib import Path
 
 from ..chain import publish_commitment, serve_axon, set_weights
 from ..core.config import NetworkConfig, load_network_config
-from ..core.constants import DEFAULT_ROLLOUT_BATCH_SIZE, MAX_PROMPT_CHARS
+from ..core.constants import DEFAULT_ROLLOUT_BATCH_SIZE, MAX_OUTPUT_TOKENS, MAX_PROMPT_CHARS
 from ..utils.crypto import write_key
 from ..datasets.dataset import (
     DEFAULT_SPLIT,
@@ -199,6 +199,7 @@ def cmd_miner_rollout(args: argparse.Namespace) -> None:
             wallet_path=args.wallet_path,
             work_dir=args.work_dir,
             batch_size=args.batch_size,
+            max_output_tokens=args.max_output_tokens,
             hf_token=_hf_token_from_env(),
         )
     except Exception as exc:
@@ -219,6 +220,7 @@ def cmd_miner_watch_rollouts(args: argparse.Namespace) -> None:
             wallet_path=args.wallet_path,
             work_dir=args.work_dir,
             batch_size=args.batch_size,
+            max_output_tokens=args.max_output_tokens,
             poll_seconds=args.poll_seconds,
             hf_token=_hf_token_from_env(),
         )
@@ -692,6 +694,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_ROLLOUT_BATCH_SIZE,
         help="Maximum active vLLM sequences. Raise on large GPUs, lower if memory is tight.",
     )
+    rollout.add_argument(
+        "--max-new-tokens",
+        "--max-output-tokens",
+        dest="max_output_tokens",
+        metavar="TOKENS",
+        type=int,
+        default=MAX_OUTPUT_TOKENS,
+        help=(
+            f"Preferred generation budget per row, from 1 to {MAX_OUTPUT_TOKENS}; "
+            "prompt plus response never exceeds the 32K context limit."
+        ),
+    )
     _add_runtime_wallet_args(rollout)
     rollout.set_defaults(func=cmd_miner_rollout)
     watch_rollouts = miner_sub.add_parser(
@@ -714,6 +728,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_ROLLOUT_BATCH_SIZE,
         help="Maximum active vLLM sequences. Raise on large GPUs, lower if memory is tight.",
+    )
+    watch_rollouts.add_argument(
+        "--max-new-tokens",
+        "--max-output-tokens",
+        dest="max_output_tokens",
+        metavar="TOKENS",
+        type=int,
+        default=MAX_OUTPUT_TOKENS,
+        help=(
+            f"Preferred generation budget per row, from 1 to {MAX_OUTPUT_TOKENS}; "
+            "prompt plus response never exceeds the 32K context limit."
+        ),
     )
     watch_rollouts.add_argument("--poll-seconds", type=int, default=60)
     watch_rollouts.add_argument("--once", action="store_true", help="Check the current window once and exit.")

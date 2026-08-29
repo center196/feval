@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 
-PROTOCOL_NETWORK = "feval-network-v26"
+PROTOCOL_NETWORK = "feval-network-v28"
 PROTOCOL_MODEL_COMMITMENT = "f3"
 PROTOCOL_MODEL_MANIFEST = "feval-model-v4"
-PROTOCOL_ROLLOUT_MANIFEST = "feval-rollouts-v15"
-PROTOCOL_VALIDATOR_STATE = "feval-validator-state-v27"
-PROTOCOL_MINER_ROLLOUT_STATE = "feval-miner-rollout-state-v12"
+PROTOCOL_ROLLOUT_MANIFEST = "feval-rollouts-v17"
+PROTOCOL_VALIDATOR_STATE = "feval-validator-state-v29"
+PROTOCOL_MINER_ROLLOUT_STATE = "feval-miner-rollout-state-v14"
 
 SUBNET_NETUID = 47
 PUBLIC_WANDB_ENTITY = "feval196-feval"
@@ -75,9 +75,12 @@ AUDIT_MAX_NUM_BATCHED_TOKENS = 4_096
 AUDIT_MAX_NUM_SEQS = 1
 
 MAX_PROMPT_CHARS = 32_768
-MAX_OUTPUT_TOKENS = 2_048
+MAX_OUTPUT_TOKENS = 32_768
+# This is a hard combined prompt-plus-response ceiling. A miner may choose any
+# lower generation budget, but each row receives only the context remaining
+# after the protocol-owned prompt is tokenized.
 MAX_CONTEXT_TOKENS = 32_768
-DEFAULT_ROLLOUT_BATCH_SIZE = 16
+DEFAULT_ROLLOUT_BATCH_SIZE = 4
 MAX_LORA_RANK = 16
 MAX_LORA_ALPHA = 256
 MAX_ABS_LORA_VALUE = 100.0
@@ -85,10 +88,11 @@ MAX_ADAPTER_BYTES = 256 * 1024 * 1024
 MAX_ADAPTER_ELEMENTS = 100_000_000
 MAX_TENSOR_DIMENSION = 65_536
 MAX_ADAPTER_CONFIG_BYTES = 64 * 1024
-# A fixed 2K cap is ample for the selected final-answer and objective
-# instruction tasks while bounding validator memory and audit cost.
+# The aggregate cap remains deliberately much smaller than 10,000 worst-case
+# 32K rows. This bounds untrusted downloads and host-memory use while allowing
+# individual long reasoning traces; miners must terminate ordinary rows early.
 MAX_ROLLOUT_BYTES = 256 * 1024 * 1024
-MAX_ROLLOUT_LINE_BYTES = 32 * 1024
+MAX_ROLLOUT_LINE_BYTES = 256 * 1024
 MAX_MANIFEST_BYTES = 64 * 1024
 
 # Only these miner-controlled files are ever downloaded. Python, pickle, model

@@ -182,6 +182,8 @@ def _normalize_state(state: Any) -> dict[str, Any]:
         "feval-validator-state-v24",
         "feval-validator-state-v25",
         "feval-validator-state-v26",
+        "feval-validator-state-v27",
+        "feval-validator-state-v28",
     }:
         # Audit semantics changed. Never carry old pass/fail decisions or
         # partial rounds into a different token-validity protocol.
@@ -436,6 +438,7 @@ def publish_miner_rollouts(
     wallet_path: str | None,
     work_dir: str | Path,
     batch_size: int,
+    max_output_tokens: int,
     hf_token: str | bool | None = None,
 ) -> dict[str, Any]:
     # The rollout manifest binds the evaluation root, and validators recompute
@@ -465,7 +468,7 @@ def publish_miner_rollouts(
         commitment=commitment,
         miner_hotkey=miner_hotkey,
         out_dir=bundle,
-        max_output_tokens=config.max_output_tokens,
+        max_output_tokens=max_output_tokens,
         batch_size=batch_size,
     )
     rollout_revision = upload_rollout_bundle(
@@ -506,6 +509,9 @@ def _load_miner_rollout_state(work_dir: str | Path) -> dict[str, Any]:
         "feval-miner-rollout-state-v8",
         "feval-miner-rollout-state-v9",
         "feval-miner-rollout-state-v10",
+        "feval-miner-rollout-state-v11",
+        "feval-miner-rollout-state-v12",
+        "feval-miner-rollout-state-v13",
     }:
         return {"protocol": PROTOCOL_MINER_ROLLOUT_STATE, "last_success": None}
     if not isinstance(state, dict) or state.get("protocol") != PROTOCOL_MINER_ROLLOUT_STATE:
@@ -543,6 +549,7 @@ class MinerRolloutRunner:
         wallet_path: str | None,
         work_dir: str | Path,
         batch_size: int,
+        max_output_tokens: int,
         poll_seconds: int = 60,
         hf_token: str | bool | None = None,
     ) -> None:
@@ -559,7 +566,17 @@ class MinerRolloutRunner:
         self.wallet_path = wallet_path
         self.work_dir = Path(work_dir)
         self.batch_size = batch_size
-        self.max_output_tokens = self.config.max_output_tokens
+        if (
+            isinstance(max_output_tokens, bool)
+            or not isinstance(max_output_tokens, int)
+            or max_output_tokens <= 0
+            or max_output_tokens > self.config.max_output_tokens
+        ):
+            raise ValueError(
+                "max_output_tokens must be between 1 and "
+                f"{self.config.max_output_tokens}"
+            )
+        self.max_output_tokens = max_output_tokens
         self.poll_seconds = poll_seconds
         self.hf_token = hf_token
         self.state = _load_miner_rollout_state(self.work_dir)
