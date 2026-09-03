@@ -9,7 +9,7 @@ from ..core.constants import (
     BASE_MODEL_REVISION,
     BURN_SHARE,
     CHALLENGER_SHARE,
-    CHAMPION_SHARES,
+    MINER_SHARE,
 )
 from ..utils.jsonutil import load_json, load_jsonl, write_json, write_jsonl
 from .merkle import leaf_hash, root_for_values
@@ -34,7 +34,7 @@ def create_demo_files(out_dir: str | Path) -> dict[str, str]:
         "promotion": {"delta_min": 0.01, "confidence_z": 2.326347874},
         "emissions": {
             "burn_uid_0": BURN_SHARE,
-            "current": sum(CHAMPION_SHARES),
+            "miners": MINER_SHARE,
             "challengers": CHALLENGER_SHARE,
         },
     }

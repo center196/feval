@@ -5,10 +5,11 @@ import math
 import random
 from typing import Iterable
 
+from ..core.constants import DATASET_WINDOW_BLOCKS
 from ..utils.jsonutil import canonical_json_bytes
 
 
-def dataset_window(block: int, window_blocks: int = 3_600) -> int:
+def dataset_window(block: int, window_blocks: int = DATASET_WINDOW_BLOCKS) -> int:
     """Return the cross-machine dataset window.
 
     Integer division is deliberately used instead of Python ``round``. Python

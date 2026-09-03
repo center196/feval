@@ -20,7 +20,7 @@ from .constants import (
     BURN_SHARE,
     CHALLENGER_SHARE,
     CHAMPION_COUNT,
-    CHAMPION_SHARES,
+    MINER_SHARE,
     DATASET_WINDOW_BLOCKS,
     EVALUATION_ROWS,
     INVALID_ROUNDS_BEFORE_BLACKLIST,
@@ -74,7 +74,7 @@ class NetworkConfig:
     max_lora_rank: int = MAX_LORA_RANK
     tensor_parallel_size: int = 1
     champion_count: int = CHAMPION_COUNT
-    champion_shares: tuple[float, ...] = CHAMPION_SHARES
+    miner_share: float = MINER_SHARE
     burn_share: float = BURN_SHARE
     challenger_share: float = CHALLENGER_SHARE
     invalid_rounds_before_blacklist: int = INVALID_ROUNDS_BEFORE_BLACKLIST
@@ -177,8 +177,8 @@ class NetworkConfig:
             )
         if self.champion_count != CHAMPION_COUNT:
             raise ValueError(f"this protocol requires exactly {CHAMPION_COUNT} champions")
-        if tuple(self.champion_shares) != CHAMPION_SHARES:
-            raise ValueError(f"this protocol requires champion_shares={CHAMPION_SHARES}")
+        if self.miner_share != MINER_SHARE:
+            raise ValueError(f"this protocol requires miner_share={MINER_SHARE}")
         if self.burn_share != BURN_SHARE:
             raise ValueError(f"this protocol requires burn_share={BURN_SHARE}")
         if self.challenger_share != CHALLENGER_SHARE:
@@ -241,6 +241,8 @@ class NetworkConfig:
             "feval-network-v27",
             "feval-network-v28",
             "feval-network-v29",
+            "feval-network-v30",
+            "feval-network-v31",
         }:
             # Operational compatibility for previously sealed configurations. All
             # code-pinned evaluation and audit-size fields take their current
@@ -262,11 +264,13 @@ class NetworkConfig:
             value["audit_min_exact_argmax_ratio"] = AUDIT_MIN_EXACT_ARGMAX_RATIO
             value["challenger_share"] = CHALLENGER_SHARE
             value["champion_count"] = CHAMPION_COUNT
-            value["champion_shares"] = list(CHAMPION_SHARES)
+            value.pop("champion_shares", None)
+            value["miner_share"] = MINER_SHARE
             value["burn_share"] = BURN_SHARE
             value["invalid_rounds_before_blacklist"] = INVALID_ROUNDS_BEFORE_BLACKLIST
             value["blacklist_duration_blocks"] = BLACKLIST_DURATION_BLOCKS
             value["blacklist_enabled"] = BLACKLIST_ENABLED
+            value["dataset_window_blocks"] = DATASET_WINDOW_BLOCKS
             value["evaluation_rows"] = EVALUATION_ROWS
             value["math_rows"] = MATH_ROWS
             value["instruction_rows"] = INSTRUCTION_ROWS
@@ -275,8 +279,6 @@ class NetworkConfig:
             value.pop("candidate_pool_root", None)
             value.pop("history_start_block", None)
             value.pop("history_batch_blocks", None)
-        if isinstance(value.get("champion_shares"), list):
-            value["champion_shares"] = tuple(value["champion_shares"])
         known = {field.name for field in cls.__dataclass_fields__.values()}
         unknown = set(value) - known
         if unknown:

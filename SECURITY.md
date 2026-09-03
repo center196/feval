@@ -99,8 +99,10 @@ the hotkey breaks a same-block tie deterministically. Replacing a commitment or
 leaving the current miner set removes that priority. Validators do not require
 historical block scans or an archive RPC endpoint.
 
-Only the positive-scoring active king receives miner emission: 1% to that UID
-and 99% to burn UID 0. With no eligible king, UID 0 receives 100%. Promotion
+UID 0 receives 90% of weight. The remaining 10% is distributed among currently
+registered, positive-scoring miners that have completed the required audit
+rounds, in proportion to their evaluation scores. Duplicate submissions are
+excluded. With no eligible miner, UID 0 receives 100%. King promotion still
 requires the configured statistical lower bound to clear the 1% margin.
 
 ## Resource limits and residual risks

@@ -24,7 +24,7 @@ from ..chain import (
     set_weight_mapping,
     wallet_hotkey_ss58,
 )
-from ..chain.champions import champion_weight_mapping, encode_reward_bits, update_champions
+from ..chain.champions import encode_reward_bits, miner_weight_mapping, update_champions
 from ..core.config import NetworkConfig, load_network_config
 from ..core.constants import PROTOCOL_MINER_ROLLOUT_STATE, PROTOCOL_VALIDATOR_STATE
 from ..datasets.dataset import prepare_candidate_pool_from_config, prepare_window_from_pool
@@ -984,38 +984,35 @@ class ValidatorRunner:
     def _reset_window(self, window: int) -> None:
         if getattr(self, "wandb_run_window", None) not in {None, window}:
             self._close_wandb_run()
-        # Continue rewarding the last verified king while the next public
-        # evaluation window accumulates ten successful audit rounds. Replace
-        # the carryover only with a newer fully valid result for that same
-        # champion; otherwise preserve the previous verified snapshot.
-        champions = self.state.get("champions", [])
+        # Continue rewarding previously verified miners while the next public
+        # evaluation window accumulates ten successful audit rounds. A current
+        # valid result replaces that miner's older verified snapshot.
+        current_results = self.state.get("results", {})
         carryover = self.state.get("carryover_results", {})
         next_carryover: dict[str, dict[str, Any]] = {}
-        if champions:
-            champion = champions[0]
-            hotkey = str(champion.get("miner_hotkey"))
-            digest = champion.get("model_digest")
-            current = self.state.get("results", {}).get(hotkey, {})
+        hotkeys = set(current_results) | (set(carryover) if isinstance(carryover, dict) else set())
+        for hotkey in hotkeys:
+            current = current_results.get(hotkey, {})
             previous = carryover.get(hotkey, {}) if isinstance(carryover, dict) else {}
             source = current if (
                 isinstance(current, dict)
                 and current.get("valid")
                 and float(current.get("score", 0.0)) > 0.0
-                and current.get("model_digest") == digest
+                and isinstance(current.get("model_digest"), str)
             ) else previous
             if (
                 isinstance(source, dict)
                 and source.get("valid")
                 and float(source.get("score", 0.0)) > 0.0
-                and source.get("model_digest") == digest
+                and isinstance(source.get("model_digest"), str)
+                and isinstance(source.get("uid"), int)
+                and not isinstance(source.get("uid"), bool)
+                and int(source["uid"]) > 0
             ):
-                if source is current:
-                    champion["last_score"] = float(source["score"])
-                    champion["last_window"] = self.state.get("window")
                 next_carryover[hotkey] = {
                     "valid": True,
                     "score": float(source["score"]),
-                    "model_digest": str(digest),
+                    "model_digest": str(source["model_digest"]),
                     "uid": source.get("uid"),
                     "carryover": True,
                     "source_window": (
@@ -1569,7 +1566,7 @@ class ValidatorRunner:
         if last is not None and current_block - int(last) < self.config.weight_interval_blocks:
             return None
         update_champions(self.state, config=self.config, current_block=current_block)
-        normalized = champion_weight_mapping(
+        normalized = miner_weight_mapping(
             self.state,
             config=self.config,
             commitments=commitments,

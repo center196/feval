@@ -239,53 +239,50 @@ def update_champions(
     return decision
 
 
-def champion_weight_mapping(
+def miner_weight_mapping(
     state: dict[str, Any],
     *,
     config: NetworkConfig,
     commitments: dict[str, dict[str, Any]],
     copies: dict[str, str],
 ) -> dict[int, float]:
-    """Apply the configured burn and active-champion allocation."""
+    """Burn 90% and score-weight the remaining 10% across eligible miners."""
 
-    by_hotkey: dict[str, float] = {}
-    for share, champion in zip(config.champion_shares, state.get("champions", [])):
-        hotkey = str(champion.get("miner_hotkey"))
-        current = commitments.get(hotkey)
-        result = state.get("results", {}).get(hotkey, {})
+    current_results = state.get("results", {})
+    carryover_results = state.get("carryover_results", {})
+    eligible: list[tuple[int, float]] = []
+    for hotkey, current in commitments.items():
+        if hotkey in copies:
+            continue
+        uid = current.get("uid")
+        if uid is None or int(uid) <= 0:
+            continue
+        result = current_results.get(hotkey, {})
         if not (
             isinstance(result, dict)
             and result.get("valid")
             and float(result.get("score", 0.0)) > 0.0
-            and result.get("model_digest") == champion.get("model_digest")
         ):
-            # Window transitions do not interrupt an already verified king's
-            # emission. Carryover is accepted only for that exact model digest
-            # and only until the king validates again or a challenger replaces
-            # it with a statistically qualified current-window result.
-            result = state.get("carryover_results", {}).get(hotkey, {})
-        if (
-            current is None
-            or hotkey in copies
-            or not result.get("valid")
-            or float(result.get("score", 0.0)) <= 0.0
+            result = carryover_results.get(hotkey, {})
+        if not (
+            isinstance(result, dict)
+            and result.get("valid")
+            and float(result.get("score", 0.0)) > 0.0
         ):
             continue
         commitment: ModelCommitment = current["commitment"]
-        if commitment.model_digest != champion.get("model_digest"):
-            continue
         if result.get("model_digest") != commitment.model_digest:
             continue
-        by_hotkey[hotkey] = by_hotkey.get(hotkey, 0.0) + float(share)
+        eligible.append((int(uid), float(result["score"])))
 
     uid_weights: dict[int, float] = {0: float(config.burn_share)}
-    allocated = 0.0
-    for hotkey, value in by_hotkey.items():
-        uid = commitments[hotkey].get("uid")
-        if uid is not None:
-            uid_weights[int(uid)] = uid_weights.get(int(uid), 0.0) + value
-            allocated += value
-    uid_weights[0] += sum(float(value) for value in config.champion_shares) - allocated
+    total_score = sum(score for _uid, score in eligible)
+    if total_score > 0.0:
+        for uid, score in eligible:
+            share = float(config.miner_share) * score / total_score
+            uid_weights[uid] = uid_weights.get(uid, 0.0) + share
+    else:
+        uid_weights[0] += float(config.miner_share)
     total = sum(uid_weights.values())
     if not math.isclose(total, 1.0, rel_tol=0.0, abs_tol=1e-12):
         raise ValueError(f"protocol weights must sum to one, received {total}")

@@ -143,8 +143,9 @@ Check liveness with `feval health --state validator-state.json`. See
 
 ## Evaluation protocol
 
-Every 3,600 finalized blocks, miners and validators derive the same 10,000-row
-evaluation set from immutable, code-pinned NVIDIA dataset revisions:
+Every 14,400 finalized blocks (approximately two days), miners and validators
+derive the same 10,000-row evaluation set from immutable, code-pinned NVIDIA
+dataset revisions:
 
 - 5,000 math rows whose expected answers can be safely verified as complete
   integers, decimals, or fractions.

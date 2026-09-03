@@ -5,7 +5,7 @@ import random
 from pathlib import Path
 from typing import Any
 
-from ..core.constants import BURN_SHARE, CHAMPION_SHARES
+from ..core.constants import BURN_SHARE, MINER_SHARE
 from ..utils.crypto import hash_file, sha256_hex, verify_signature
 from ..utils.jsonutil import canonical_json_bytes, load_json, load_jsonl, write_json
 from ..protocol.merkle import root_for_values
@@ -227,22 +227,30 @@ def write_weights(state_path: str | Path, score_paths: list[str], audit_paths: l
     audit_reports = [load_json(path) for path in audit_paths]
     audits = {report.get("adapter_hash"): report for report in audit_reports}
     scores_by_hash = {score.get("adapter_hash"): score for score in scores}
-    weights: dict[str, float] = {}
-    champion_splits = list(CHAMPION_SHARES)
-    for split, champion in zip(champion_splits, state.get("champions", [])):
-        adapter_hash = champion.get("adapter_hash")
-        score = scores_by_hash.get(adapter_hash, {})
+    eligible_by_hotkey: dict[str, float] = {}
+    for adapter_hash, score in scores_by_hash.items():
         audit = audits.get(adapter_hash, {})
         if (
             not score.get("valid")
             or not audit.get("valid")
             or float(score.get("score", 0.0)) <= 0.0
-            or score.get("miner_hotkey") != champion.get("miner_hotkey")
+            or not isinstance(score.get("miner_hotkey"), str)
         ):
             continue
-        hotkey = champion["miner_hotkey"]
-        weights[hotkey] = weights.get(hotkey, 0.0) + split
-    weights = dict(sorted(weights.items()))
+        hotkey = score["miner_hotkey"]
+        eligible_by_hotkey[hotkey] = max(
+            eligible_by_hotkey.get(hotkey, 0.0),
+            float(score["score"]),
+        )
+    total_score = sum(eligible_by_hotkey.values())
+    weights = (
+        {
+            hotkey: MINER_SHARE * score / total_score
+            for hotkey, score in sorted(eligible_by_hotkey.items())
+        }
+        if total_score > 0.0
+        else {}
+    )
     uid_weights = None
     if uid_map_path:
         uid_map = load_json(uid_map_path)
@@ -252,9 +260,11 @@ def write_weights(state_path: str | Path, score_paths: list[str], audit_paths: l
             if hotkey not in uid_map:
                 continue
             uid = str(uid_map[hotkey])
+            if uid == "0":
+                continue
             uid_weights[uid] = uid_weights.get(uid, 0.0) + weight
             assigned += weight
-        uid_weights["0"] += sum(float(value) for value in CHAMPION_SHARES) - assigned
+        uid_weights["0"] += MINER_SHARE - assigned
     report = {"protocol": "feval-weights-v1", "weights": weights, "uid_weights": uid_weights, "champions": state.get("champions", [])}
     write_json(out_path, report)
     return report
