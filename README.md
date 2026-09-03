@@ -112,6 +112,12 @@ feval validator run \
   -w <wallet-name> -H <hotkey-name> -n finney
 ```
 
+Feval automatically starts vLLM workers with `spawn` and uses the native sampler
+to avoid fork-related startup hangs and FlashInfer sampler warmup failures.
+No environment exports are needed for these defaults. Explicit
+`VLLM_WORKER_MULTIPROC_METHOD` and `VLLM_USE_FLASHINFER_SAMPLER` settings still
+override them.
+
 Keep `validator-state.json` and its backup between restarts. To verify a setup
 without submitting weights, run one cycle with:
 

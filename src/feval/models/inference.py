@@ -48,10 +48,15 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def configure_vllm_environment() -> None:
-    # Canonical miner decoding uses vLLM's V1 batch-level custom logits
-    # processor. vLLM 0.27 selects V1 itself; setting the removed VLLM_USE_V1
-    # variable only produces a warning. Cleanup below bounds EngineCore life.
+    # vLLM 0.27 selects the V1 engine itself; the removed VLLM_USE_V1
+    # variable only produces a warning.
     os.environ.pop("VLLM_USE_V1", None)
+    # Feval loads libraries and may start reporting threads before the GPU
+    # worker. Spawn avoids inheriting their locks through a Linux fork.
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    # Use vLLM's native sampler so FlashInfer's optional sampling warmup cannot
+    # fail startup on Blackwell/CUDA toolkit combinations it cannot compile for.
+    os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
     # Newer vLLM releases always use an EngineCore process for supported model
     # families. Keep its own worker cleanup bounded as a second line of defence.
     os.environ.setdefault("VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS", "5")
