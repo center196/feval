@@ -25,6 +25,10 @@ needed:
 cp .env.example .env
 ```
 
+The CLI reads `.env` from the current working directory before running a
+command. Run it from the directory containing your `.env`; values already
+exported in the shell take precedence over that file.
+
 Set `HF_TOKEN` on miner hosts that upload to Hugging Face. Validators do not
 need a Hugging Face token when model and rollout repositories are public.
 Never commit `.env`, wallet files, private keys, tokens, or validator state.
@@ -101,6 +105,10 @@ an invitation or team membership. Each validator authenticates with its own
 W&B account by setting `WANDB_API_KEY`, and Feval automatically publishes its
 public result summary to this fixed destination. Reporting failures are visible
 in validator status but never change evaluation or emitted weights.
+
+Set `FEVAL_REPORT_WANDB=0` in `.env` to disable automatic reporting. The public
+destination is `WANDB_ENTITY=feval196-feval` and `WANDB_PROJECT=feval-valid`;
+validator results always use that shared destination.
 
 Run continuously:
 

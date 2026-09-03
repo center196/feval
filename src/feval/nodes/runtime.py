@@ -1606,6 +1606,10 @@ class ValidatorRunner:
     def _maybe_report_results(self) -> dict[str, Any]:
         """Publish only the public summary bundle; reporting never affects consensus."""
 
+        if os.environ.get("FEVAL_REPORT_WANDB", "1").strip().lower() in {"0", "false", "no", "off"}:
+            self._close_wandb_run()
+            return {"status": "disabled"}
+
         try:
             out_dir = self.work_dir / "results" / f"window-{self.state.get('window')}"
             manifest = export_results_bundle(

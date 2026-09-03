@@ -459,6 +459,7 @@ def cmd_validator_run(args: argparse.Namespace) -> None:
             wallet_path=args.wallet_path,
             work_dir=args.work_dir,
             state_path=args.state,
+            hf_token=_hf_token_from_env(),
             dry_run_weights=args.dry_run_weights,
             poll_seconds=args.poll_seconds,
         )
