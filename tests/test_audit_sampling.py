@@ -71,7 +71,7 @@ class CorrectAuditSamplingTests(unittest.TestCase):
     def test_dataset_upgrade_clears_prior_validator_results(self) -> None:
         state = _normalize_state(
             {
-                "protocol": "feval-validator-state-v33",
+                "protocol": "feval-validator-state-v34",
                 "window": 7,
                 "pending": {"miner": {}},
                 "results": {"miner": {"score": 1.0}},
@@ -91,7 +91,7 @@ class CorrectAuditSamplingTests(unittest.TestCase):
             state_path.write_text(
                 json.dumps(
                     {
-                        "protocol": "feval-miner-rollout-state-v16",
+                        "protocol": "feval-miner-rollout-state-v17",
                         "last_success": {"dataset_window": 7},
                     }
                 ),

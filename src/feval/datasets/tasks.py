@@ -8,9 +8,9 @@ regular expressions, and verifier metadata are never compiled or executed.
 
 Only three verifiers exist, and all three are pure string work:
 
-* ``strict_numeric``     exact Fraction equality on a complete number
+* ``strict_numeric``     static final-answer extraction and exact rational match
 * ``mcqa_letter``        one option letter
-* ``json_output_exact``  exact match of a predicted program output
+* ``json_output_exact``  final JSON extraction and exact predicted-output match
 
 No LLM judge, no symbolic algebra, and no code execution anywhere.
 """
@@ -34,8 +34,8 @@ MCQA_SUFFIX = (
     "Do not include reasoning."
 )
 CODE_OUTPUT_SUFFIX = (
-    "\n\nReturn only a JSON object of the form {\"output\": \"...\"} holding the "
-    "exact predicted output string. Do not include reasoning."
+    "\n\nYou may include a long reasoning trace. End with a JSON object of the "
+    "form {\"output\": \"...\"} holding the exact predicted output string."
 )
 
 # Multiple-choice rows are kept only at this width. Narrower questions hand a

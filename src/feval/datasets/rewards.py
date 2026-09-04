@@ -27,9 +27,14 @@ def numeric_value(value: Any) -> float | None:
 _PLAIN_NUMBER = re.compile(r"^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$")
 _PLAIN_FRACTION = re.compile(r"^([+-]?\d+)\s*/\s*([+-]?\d+)$")
 _LATEX_FRACTION = re.compile(r"^\\frac\s*\{([+-]?\d+)\}\s*\{([+-]?\d+)\}$")
-_BOXED_FINAL = re.compile(
-    r"\\boxed\s*\{\s*(\\frac\s*\{[+-]?\d+\}\s*\{[+-]?\d+\}|[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?|[+-]?\d+\s*/\s*[+-]?\d+)\s*\}"
+_FINAL_ANSWER_MARKERS = (
+    "final answer is",
+    "final answer:",
+    "the answer is",
+    "answer is",
+    "answer:",
 )
+_MAX_JSON_OBJECT_STARTS = 128
 
 
 def _strip_math_wrappers(value: str) -> str:
@@ -46,23 +51,8 @@ def _strip_math_wrappers(value: str) -> str:
     return text.rstrip(". ")
 
 
-def strict_numeric_fraction(value: Any) -> Fraction | None:
-    """Parse only a complete, inert numeric answer.
-
-    This intentionally rejects free-form expressions, variables, functions,
-    Python syntax, and answers containing explanatory text. It never calls
-    ``eval``, SymPy, a shell, or a model.
-    """
-
+def _parse_numeric_literal(value: Any) -> Fraction | None:
     text = _strip_math_wrappers(str(value))
-    boxed = list(_BOXED_FINAL.finditer(text))
-    if boxed:
-        # A boxed answer is accepted only when it is the final non-whitespace
-        # content. This prevents selecting an arbitrary number from reasoning.
-        last = boxed[-1]
-        if text[last.end() :].strip(". "):
-            return None
-        text = last.group(1).strip()
     fraction = _LATEX_FRACTION.fullmatch(text) or _PLAIN_FRACTION.fullmatch(text)
     if fraction:
         numerator, denominator = int(fraction.group(1)), int(fraction.group(2))
@@ -78,6 +68,95 @@ def strict_numeric_fraction(value: Any) -> Fraction | None:
     if not decimal.is_finite():
         return None
     return Fraction(decimal)
+
+
+def _last_balanced_boxed(text: str) -> str | None:
+    r"""Return the last balanced ``\boxed{...}`` body without interpreting it."""
+
+    search_end = len(text)
+    while True:
+        start = text.rfind(r"\boxed", 0, search_end)
+        if start < 0:
+            return None
+        brace = start + len(r"\boxed")
+        while brace < len(text) and text[brace].isspace():
+            brace += 1
+        if brace < len(text) and text[brace] == "{":
+            depth = 1
+            cursor = brace + 1
+            while cursor < len(text):
+                if text[cursor] == "{":
+                    depth += 1
+                elif text[cursor] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return text[brace + 1 : cursor].strip()
+                cursor += 1
+        search_end = start
+
+
+def _last_answer_tag(text: str) -> str | None:
+    lowered = text.lower()
+    start = lowered.rfind("<answer>")
+    if start < 0:
+        return None
+    start += len("<answer>")
+    end = lowered.find("</answer>", start)
+    if end < 0:
+        return None
+    return text[start:end].strip()
+
+
+def _last_marker_candidate(text: str) -> str | None:
+    lowered = text.lower()
+    matches = [
+        (lowered.rfind(marker), marker)
+        for marker in _FINAL_ANSWER_MARKERS
+        if lowered.rfind(marker) >= 0
+    ]
+    if not matches:
+        return None
+    position, marker = max(matches, key=lambda item: item[0])
+    candidate = text[position + len(marker) :].strip()
+    return candidate or None
+
+
+def _parse_numeric_candidate(value: Any) -> Fraction | None:
+    parsed = _parse_numeric_literal(value)
+    if parsed is not None:
+        return parsed
+    boxed = _last_balanced_boxed(str(value))
+    return _parse_numeric_literal(boxed) if boxed is not None else None
+
+
+def strict_numeric_fraction(value: Any) -> Fraction | None:
+    r"""Extract and normalize one inert numeric final answer.
+
+    Reviewed static forms mirror common Qwen-style outputs: a complete numeric
+    response, the last balanced ``\boxed{...}``, an ``<answer>`` body, or a
+    final ``Answer``/``Final answer`` marker. Only an integer, decimal, or
+    fraction is accepted after extraction. No expression is evaluated and no
+    symbolic parser, shell, model, or dataset-supplied pattern is invoked.
+    """
+
+    text = str(value).strip()
+    if not text:
+        return None
+    parsed = _parse_numeric_literal(text)
+    if parsed is not None:
+        return parsed
+    tagged = _last_answer_tag(text)
+    if tagged is not None:
+        parsed = _parse_numeric_candidate(tagged)
+        if parsed is not None:
+            return parsed
+    boxed = _last_balanced_boxed(text)
+    if boxed is not None:
+        parsed = _parse_numeric_literal(boxed)
+        if parsed is not None:
+            return parsed
+    marked = _last_marker_candidate(text)
+    return _parse_numeric_candidate(marked) if marked is not None else None
 
 
 def canonical_numeric_answer(value: Any) -> str | None:
@@ -335,26 +414,33 @@ def reward_mcqa_letter(answer: Any, expected: Any) -> int:
 
 
 def extract_json_output(answer: Any) -> str | None:
-    """Return the ``output`` field of a predicted-output response.
+    """Return ``output`` from a final one-field JSON object.
 
-    Leading and trailing whitespace is part of a predicted program output, so
-    the raw text is never stripped before comparison. Only the search for a
-    JSON wrapper ignores surrounding space.
+    Surrounding reasoning remains inert text. JSON decoding never evaluates the
+    predicted program, and whitespace inside the decoded string is preserved.
     """
 
-    probe = str(answer).strip()
-    if not probe:
+    text = str(answer).rstrip()
+    # A Markdown code fence is presentation syntax, not part of the JSON. Only
+    # a closing fence at the end is ignored; prose after the answer is rejected.
+    text = re.sub(r"(?:^|\n)[ \t]*```[ \t]*$", "", text).rstrip()
+    starts = [index for index, character in enumerate(text) if character == "{"]
+    if not starts:
         return None
-    try:
-        value = json.loads(probe)
-    except (ValueError, TypeError):
-        return None
-    if (
-        isinstance(value, dict)
-        and set(value) == {"output"}
-        and isinstance(value.get("output"), str)
-    ):
-        return value["output"]
+    decoder = json.JSONDecoder()
+    for start in reversed(starts[-_MAX_JSON_OBJECT_STARTS:]):
+        try:
+            value, end = decoder.raw_decode(text, start)
+        except (ValueError, TypeError):
+            continue
+        if text[end:].strip():
+            continue
+        if (
+            isinstance(value, dict)
+            and set(value) == {"output"}
+            and isinstance(value.get("output"), str)
+        ):
+            return value["output"]
     return None
 
 
@@ -376,7 +462,9 @@ def reward_answer(answer: Any, expected: Any, tolerance: float = 1e-6, verifier:
         answer_number = strict_numeric_fraction(answer)
         if answer_number is None:
             return 0
-        return int(any(answer_number == strict_numeric_fraction(value) for value in expected_values))
+        answer_normalized = canonical_numeric_answer(answer_number)
+        expected_normalized = [canonical_numeric_answer(value) for value in expected_values]
+        return int(any(answer_normalized == value for value in expected_normalized if value is not None))
     expected_number = next((numeric_value(value) for value in expected_values if numeric_value(value) is not None), None)
     answer_number = numeric_value(answer)
     if expected_number is not None and answer_number is not None:
@@ -389,4 +477,3 @@ def reward_for_row(answer: Any, row: dict[str, Any], tolerance: float = 1e-6) ->
     if verifier == "instruction_constraints":
         return reward_instruction_constraints(answer, row.get("constraints", []))
     return reward_answer(answer, row.get("expected"), tolerance, verifier)
-

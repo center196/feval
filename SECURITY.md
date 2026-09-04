@@ -81,20 +81,23 @@ Production miner and validator commands expose no local dataset path, scan
 limit, or protocol context-cap override. Changing a dataset or verifier requires a
 reviewed protocol release adopted by validators and miners.
 
-The math verifier intentionally accepts only complete, strictly parsed integer,
-decimal, and fraction answers. Symbolic algebra and proof answers in the wider
-NVIDIA math dataset are filtered out. CrossThink prompts that visibly request
-multiple answers are also excluded because their scalar label is ambiguous.
-This is safe and fast, but it is not a replacement for NVIDIA NeMo-Skills' full
-symbolic math grading.
+The math verifier statically extracts a final answer from reviewed wrappers and
+then accepts only a strictly parsed integer, decimal, or simple fraction.
+Symbolic algebra and proof answers in the wider NVIDIA math dataset are filtered
+out. It does not fall back to an arbitrary trailing number. CrossThink prompts
+that visibly request multiple answers are also excluded because their scalar
+label is ambiguous. This is safe and fast, but it is not a replacement for
+NVIDIA NeMo-Skills' full symbolic math grading.
 
 MCQA grading uses reviewed local patterns and, where the source supplies them,
 requires declared option keys to agree with the rendered prompt. Code-output
-ground truths are read from bounded inert syntax trees and responses must be a
-complete one-field JSON object. Dataset-supplied code, regular expressions,
-templates, metadata, and program snippets are never evaluated, compiled,
-imported, or executed. Unsupported, malformed, suspicious, URL-bearing,
-secret-requesting, or command-like prompts are excluded deterministically.
+ground truths are read from bounded inert syntax trees. Responses may include a
+long reasoning trace; the final one-field JSON object is decoded and its
+string value is compared exactly. Dataset-supplied code, regular expressions,
+templates, metadata, reasoning, and program snippets are never evaluated,
+compiled, imported, or executed. Unsupported, malformed, suspicious,
+URL-bearing, secret-requesting, or command-like prompts are excluded
+deterministically.
 
 ## Current commitments and rewards
 

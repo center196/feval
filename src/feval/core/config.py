@@ -221,6 +221,7 @@ class NetworkConfig:
             "feval-network-v33",
             "feval-network-v34",
             "feval-network-v35",
+            "feval-network-v36",
         }:
             # Operational compatibility for previously sealed configurations. All
             # code-pinned evaluation and audit-size fields take their current
@@ -252,7 +253,9 @@ class NetworkConfig:
             value["evaluation_rows"] = EVALUATION_ROWS
             # v34 replaced the two-dataset pins with one code-pinned source table;
             # v35 restricts rollout audits to correctly scored rows; v36 pins
-            # source-faithful answer extraction and strict static verifiers.
+            # source-faithful answer extraction and strict static verifiers;
+            # v37 adds inert final-answer extraction and permits reasoning
+            # before the final JSON result in code-output prompts.
             for retired in (
                 "math_dataset", "math_revision", "math_rows",
                 "instruction_dataset", "instruction_revision", "instruction_rows",

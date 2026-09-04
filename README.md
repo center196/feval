@@ -159,9 +159,9 @@ Check liveness with `feval health --state validator-state.json`. See
 
 Every 14,400 finalized blocks (approximately two days), miners and validators
 derive the same 10,000-row evaluation set from immutable, code-pinned dataset
-revisions. Every row is settled by exact string comparison. There is no model
-judge, no symbolic algebra, and no execution of dataset or model code anywhere
-in the grading path.
+revisions. Every row is settled by deterministic normalization followed by
+exact equality. There is no model judge, no symbolic algebra, and no execution
+of dataset or model code anywhere in the grading path.
 
 | Source | Rows | Verifier |
 | --- | --- | --- |
@@ -173,18 +173,22 @@ in the grading path.
 
 The three verifiers are:
 
-- `strict_numeric` compares complete integers, decimals, and fractions by exact
-  `Fraction` equality. Expressions, variables, and prose are rejected rather
-  than approximated.
+- `strict_numeric` statically extracts a final integer, decimal, or simple
+  fraction from a complete numeric response, the last balanced `\boxed{...}`,
+  an `<answer>...</answer>` body, or an `Answer`/`Final answer` marker. Both
+  sides are reduced to a canonical rational string and compared exactly.
+  Arbitrary last-number guessing, expressions, variables, symbolic algebra,
+  and approximate comparisons are rejected.
 - `mcqa_letter` compares one option letter. Only ten-option questions are kept,
   and Knowledge-MCQA's declared option keys must agree with the options rendered
   in the prompt. Static local parsing accepts the source layouts `A:`, `A.`, and
   `A)`; source-provided regular expressions are never compiled. Blind guessing
   is therefore worth 10% on these rows rather than 25%.
-- `json_output_exact` requires one complete JSON object with exactly one string
-  field named `output`, then compares that field byte for byte, including its
-  leading and trailing whitespace. The program is never run; the expected
-  output ships with the pinned revision.
+- `json_output_exact` permits a long reasoning trace, statically extracts the
+  final JSON object having exactly one string field named `output`, then
+  compares that field byte for byte, including its leading and trailing
+  whitespace. Reasoning and program text remain inert and are never run; the
+  expected output ships with the pinned revision.
 
 6,500 of the 10,000 rows use a verifier where guessing is worthless, and the
 protocol refuses to build a window that falls below that floor. A miner that
@@ -218,9 +222,10 @@ current commitment block, with the hotkey as a deterministic same-block tie
 breaker. Replacing a commitment or leaving the current miner set removes its
 priority.
 
-The math checker is deliberately narrower than a full symbolic grader: it
-accepts only complete numeric answers, which drops most of the symbolic rows in
-the source datasets. That is the intended trade. It keeps validation
+The math checker is deliberately narrower than a full symbolic grader: after
+static final-answer extraction, it accepts only simple numeric literals. This
+drops most symbolic rows in the source datasets. That is the intended trade. It
+keeps validation
 deterministic across GPUs and runtimes, inexpensive, and free of dataset code
 execution, and it means two validators can never disagree about a score. See
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for dataset licences and

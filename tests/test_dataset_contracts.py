@@ -149,6 +149,8 @@ class DatasetNormalizerContractTests(unittest.TestCase):
         self.assertIsNotNone(accepted)
         self.assertEqual(accepted["expected"], ["a\n b"])
         self.assertTrue(accepted["prompt"].endswith(CODE_OUTPUT_SUFFIX))
+        self.assertIn("may include a long reasoning trace", accepted["prompt"])
+        self.assertIn("End with a JSON object", accepted["prompt"])
 
         self.assertIsNone(
             normalize_code_understanding(
@@ -178,20 +180,83 @@ class RewardContractTests(unittest.TestCase):
         self.assertEqual(reward_answer("0.333", ["1/3"], verifier="strict_numeric"), 0)
         self.assertEqual(reward_answer("about 2", ["2"], verifier="strict_numeric"), 0)
 
+    def test_strict_numeric_extracts_static_final_answer_forms(self) -> None:
+        reasoning = "We compute the two terms and obtain 40 + 2."
+        accepted = (
+            reasoning + r" Therefore, \boxed{42}",
+            reasoning + "\nAnswer: 42",
+            reasoning + "\nThe answer is 42.",
+            reasoning + "\nFinal answer: 42",
+            reasoning + "\n" + r"<answer>\boxed{42}</answer>",
+            reasoning + "\n" + r"Final answer: \boxed{\frac{84}{2}}",
+        )
+        for response in accepted:
+            with self.subTest(response=response):
+                self.assertEqual(
+                    reward_answer(response, ["42"], verifier="strict_numeric"),
+                    1,
+                )
+
+    def test_strict_numeric_does_not_guess_or_evaluate(self) -> None:
+        rejected = (
+            "First I found 40, then added 2.",
+            r"Final answer: \sqrt{1764}",
+            "Answer: 40 + 2",
+            "Answer: __import__('os').system('echo unsafe')",
+        )
+        for response in rejected:
+            with self.subTest(response=response):
+                self.assertEqual(
+                    reward_answer(response, ["42"], verifier="strict_numeric"),
+                    0,
+                )
+
     def test_mcqa_uses_static_source_compatible_wrappers(self) -> None:
         self.assertEqual(reward_answer("C", ["C"], verifier="mcqa_letter"), 1)
         self.assertEqual(reward_answer(r"\boxed{C}", ["C"], verifier="mcqa_letter"), 1)
         self.assertEqual(reward_answer("Answer: C", ["C"], verifier="mcqa_letter"), 1)
         self.assertEqual(reward_answer("The choice is C", ["C"], verifier="mcqa_letter"), 0)
 
-    def test_code_output_requires_one_complete_json_object_and_exact_value(self) -> None:
+    def test_code_output_allows_reasoning_then_exact_json_value(self) -> None:
         expected = [" a\n b "]
         response = json.dumps({"output": expected[0]})
         self.assertEqual(reward_answer(response, expected, verifier="json_output_exact"), 1)
         self.assertEqual(reward_answer(expected[0], expected, verifier="json_output_exact"), 0)
         self.assertEqual(
             reward_answer(f"reasoning\n{response}", expected, verifier="json_output_exact"),
+            1,
+        )
+        self.assertEqual(
+            reward_answer(
+                f"Long reasoning is allowed.\n```json\n{response}\n```",
+                expected,
+                verifier="json_output_exact",
+            ),
+            1,
+        )
+        self.assertEqual(
+            reward_answer(
+                f'{response}\n{json.dumps({"output": expected[0], "extra": True})}',
+                expected,
+                verifier="json_output_exact",
+            ),
             0,
+        )
+        self.assertEqual(
+            reward_answer(
+                f"{response}\nThis is trailing prose.",
+                expected,
+                verifier="json_output_exact",
+            ),
+            0,
+        )
+        self.assertEqual(
+            reward_answer(
+                f'{json.dumps({"output": "wrong"})}\nAfter checking:\n{response}',
+                expected,
+                verifier="json_output_exact",
+            ),
+            1,
         )
         self.assertEqual(
             reward_answer(

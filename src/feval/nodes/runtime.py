@@ -193,6 +193,7 @@ def _normalize_state(state: Any) -> dict[str, Any]:
         "feval-validator-state-v31",
         "feval-validator-state-v32",
         "feval-validator-state-v33",
+        "feval-validator-state-v34",
     }:
         # Audit semantics changed. Never carry old pass/fail decisions or
         # partial rounds into a different token-validity protocol.
@@ -524,6 +525,7 @@ def _load_miner_rollout_state(work_dir: str | Path) -> dict[str, Any]:
         "feval-miner-rollout-state-v14",
         "feval-miner-rollout-state-v15",
         "feval-miner-rollout-state-v16",
+        "feval-miner-rollout-state-v17",
     }:
         return {"protocol": PROTOCOL_MINER_ROLLOUT_STATE, "last_success": None}
     if not isinstance(state, dict) or state.get("protocol") != PROTOCOL_MINER_ROLLOUT_STATE:

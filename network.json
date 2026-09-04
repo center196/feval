@@ -28,7 +28,7 @@
   "netuid": 47,
   "promotion_confidence_z": 2.326347874,
   "promotion_delta_min": 0.01,
-  "protocol": "feval-network-v36",
+  "protocol": "feval-network-v37",
   "sources_digest": "2211953675f5eb08a3f02df9274125e1aca2d6bc7f973ea881e29a7921253577",
   "tensor_parallel_size": 1,
   "weight_interval_blocks": 150,

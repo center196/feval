@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 
-PROTOCOL_NETWORK = "feval-network-v36"
+PROTOCOL_NETWORK = "feval-network-v37"
 PROTOCOL_MODEL_COMMITMENT = "f3"
 PROTOCOL_MODEL_MANIFEST = "feval-model-v4"
-PROTOCOL_ROLLOUT_MANIFEST = "feval-rollouts-v19"
-PROTOCOL_VALIDATOR_STATE = "feval-validator-state-v34"
-PROTOCOL_MINER_ROLLOUT_STATE = "feval-miner-rollout-state-v17"
+PROTOCOL_ROLLOUT_MANIFEST = "feval-rollouts-v20"
+PROTOCOL_VALIDATOR_STATE = "feval-validator-state-v35"
+PROTOCOL_MINER_ROLLOUT_STATE = "feval-miner-rollout-state-v18"
 
 SUBNET_NETUID = 47
 PUBLIC_WANDB_ENTITY = "feval196-feval"
