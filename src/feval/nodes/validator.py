@@ -227,6 +227,18 @@ def write_weights(state_path: str | Path, score_paths: list[str], audit_paths: l
     audit_reports = [load_json(path) for path in audit_paths]
     audits = {report.get("adapter_hash"): report for report in audit_reports}
     scores_by_hash = {score.get("adapter_hash"): score for score in scores}
+    uid_map = load_json(uid_map_path) if uid_map_path else None
+    mapped_uids: dict[str, int] = {}
+    if isinstance(uid_map, dict):
+        for hotkey, raw_uid in uid_map.items():
+            if isinstance(raw_uid, bool):
+                continue
+            try:
+                uid = int(raw_uid)
+            except (TypeError, ValueError):
+                continue
+            if uid > 0:
+                mapped_uids[str(hotkey)] = uid
     eligible_by_hotkey: dict[str, float] = {}
     for adapter_hash, score in scores_by_hash.items():
         audit = audits.get(adapter_hash, {})
@@ -238,30 +250,31 @@ def write_weights(state_path: str | Path, score_paths: list[str], audit_paths: l
         ):
             continue
         hotkey = score["miner_hotkey"]
+        if uid_map is not None and hotkey not in mapped_uids:
+            continue
         eligible_by_hotkey[hotkey] = max(
             eligible_by_hotkey.get(hotkey, 0.0),
             float(score["score"]),
         )
-    total_score = sum(eligible_by_hotkey.values())
-    weights = (
-        {
-            hotkey: MINER_SHARE * score / total_score
-            for hotkey, score in sorted(eligible_by_hotkey.items())
-        }
-        if total_score > 0.0
-        else {}
-    )
+    weights: dict[str, float] = {}
+    if eligible_by_hotkey:
+        winner_hotkey, _winner_score = min(
+            eligible_by_hotkey.items(),
+            key=lambda item: (
+                -item[1],
+                mapped_uids.get(item[0], 0),
+                item[0],
+            ),
+        )
+        weights[winner_hotkey] = MINER_SHARE
     uid_weights = None
-    if uid_map_path:
-        uid_map = load_json(uid_map_path)
+    if uid_map is not None:
         uid_weights = {"0": float(BURN_SHARE)}
         assigned = 0.0
         for hotkey, weight in weights.items():
-            if hotkey not in uid_map:
+            if hotkey not in mapped_uids:
                 continue
-            uid = str(uid_map[hotkey])
-            if uid == "0":
-                continue
+            uid = str(mapped_uids[hotkey])
             uid_weights[uid] = uid_weights.get(uid, 0.0) + weight
             assigned += weight
         uid_weights["0"] += MINER_SHARE - assigned

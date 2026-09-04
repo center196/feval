@@ -34,7 +34,7 @@ def create_demo_files(out_dir: str | Path) -> dict[str, str]:
         "promotion": {"delta_min": 0.01, "confidence_z": 2.326347874},
         "emissions": {
             "burn_uid_0": BURN_SHARE,
-            "miners": MINER_SHARE,
+            "winner": MINER_SHARE,
             "challengers": CHALLENGER_SHARE,
         },
     }

@@ -99,11 +99,12 @@ the hotkey breaks a same-block tie deterministically. Replacing a commitment or
 leaving the current miner set removes that priority. Validators do not require
 historical block scans or an archive RPC endpoint.
 
-UID 0 receives 90% of weight. The remaining 10% is distributed among currently
-registered, positive-scoring miners that have completed the required audit
-rounds, in proportion to their evaluation scores. Duplicate submissions are
-excluded. With no eligible miner, UID 0 receives 100%. King promotion still
-requires the configured statistical lower bound to clear the 1% margin.
+UID 0 receives 90% of weight. The highest-scoring currently registered miner
+that has completed the required audit rounds receives the remaining 10%.
+Duplicate submissions are excluded, and score ties resolve by lowest UID and
+then hotkey. With no eligible miner, UID 0 receives 100%. King promotion remains
+separate and requires the configured statistical lower bound to clear the 1%
+margin.
 
 ## Resource limits and residual risks
 

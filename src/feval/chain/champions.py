@@ -239,18 +239,18 @@ def update_champions(
     return decision
 
 
-def miner_weight_mapping(
+def winner_weight_mapping(
     state: dict[str, Any],
     *,
     config: NetworkConfig,
     commitments: dict[str, dict[str, Any]],
     copies: dict[str, str],
 ) -> dict[int, float]:
-    """Burn 90% and score-weight the remaining 10% across eligible miners."""
+    """Give 90% to UID 0 and 10% to the highest-scoring eligible miner."""
 
     current_results = state.get("results", {})
     carryover_results = state.get("carryover_results", {})
-    eligible: list[tuple[int, float]] = []
+    eligible: list[tuple[float, int, str]] = []
     for hotkey, current in commitments.items():
         if hotkey in copies:
             continue
@@ -273,14 +273,15 @@ def miner_weight_mapping(
         commitment: ModelCommitment = current["commitment"]
         if result.get("model_digest") != commitment.model_digest:
             continue
-        eligible.append((int(uid), float(result["score"])))
+        eligible.append((float(result["score"]), int(uid), hotkey))
 
     uid_weights: dict[int, float] = {0: float(config.burn_share)}
-    total_score = sum(score for _uid, score in eligible)
-    if total_score > 0.0:
-        for uid, score in eligible:
-            share = float(config.miner_share) * score / total_score
-            uid_weights[uid] = uid_weights.get(uid, 0.0) + share
+    if eligible:
+        _score, winner_uid, _hotkey = min(
+            eligible,
+            key=lambda item: (-item[0], item[1], item[2]),
+        )
+        uid_weights[winner_uid] = float(config.miner_share)
     else:
         uid_weights[0] += float(config.miner_share)
     total = sum(uid_weights.values())

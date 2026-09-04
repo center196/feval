@@ -24,7 +24,7 @@ from ..chain import (
     set_weight_mapping,
     wallet_hotkey_ss58,
 )
-from ..chain.champions import encode_reward_bits, miner_weight_mapping, update_champions
+from ..chain.champions import encode_reward_bits, update_champions, winner_weight_mapping
 from ..core.config import NetworkConfig, load_network_config
 from ..core.constants import PROTOCOL_MINER_ROLLOUT_STATE, PROTOCOL_VALIDATOR_STATE
 from ..datasets.dataset import prepare_candidate_pool_from_config, prepare_window_from_pool
@@ -1566,7 +1566,7 @@ class ValidatorRunner:
         if last is not None and current_block - int(last) < self.config.weight_interval_blocks:
             return None
         update_champions(self.state, config=self.config, current_block=current_block)
-        normalized = miner_weight_mapping(
+        normalized = winner_weight_mapping(
             self.state,
             config=self.config,
             commitments=commitments,
