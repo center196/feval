@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import random
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from ..core.constants import BURN_SHARE, MINER_SHARE
 from ..utils.crypto import hash_file, sha256_hex, verify_signature
@@ -81,9 +81,16 @@ def score_submission(config_path: str | Path, eval_path: str | Path, submission_
     return report
 
 
-def choose_audit_rows(submission: dict[str, Any], seed: str, count: int, positive_ratio: float = 0.8) -> list[str]:
+def choose_audit_rows(
+    submission: dict[str, Any],
+    seed: str,
+    count: int,
+    *,
+    correct_row_ids: Iterable[str],
+) -> list[str]:
     rows = list(submission.get("rows", []))
-    positives = [row for row in rows if int(row.get("reward_claimed", 0)) > 0]
+    correct = set(correct_row_ids)
+    eligible = [row for row in rows if str(row.get("row_id")) in correct]
     rng = random.Random(sha256_hex(canonical_json_bytes({
         "seed": seed,
         "miner_hotkey": submission.get("miner_hotkey"),
@@ -91,33 +98,8 @@ def choose_audit_rows(submission: dict[str, Any], seed: str, count: int, positiv
         "answer_root": submission.get("answer_root"),
         "rollout_root": submission.get("rollout_root"),
     })))
-    selected: list[str] = []
-    selected_set: set[str] = set()
-    positive_budget = min(count, round(count * positive_ratio))
-    for pool, budget in ((positives, positive_budget), (rows, count - positive_budget)):
-        shuffled = pool[:]
-        rng.shuffle(shuffled)
-        for row in shuffled:
-            if len(selected) >= count:
-                break
-            row_id = row["row_id"]
-            if row_id in selected_set:
-                continue
-            selected.append(row_id)
-            selected_set.add(row_id)
-        if len(selected) >= count:
-            break
-    if len(selected) < count:
-        shuffled = rows[:]
-        rng.shuffle(shuffled)
-        for row in shuffled:
-            row_id = row["row_id"]
-            if row_id not in selected_set:
-                selected.append(row_id)
-                selected_set.add(row_id)
-            if len(selected) >= count:
-                break
-    return selected
+    rng.shuffle(eligible)
+    return [str(row["row_id"]) for row in eligible[:count]]
 
 
 def audit_submission(config_path: str | Path, eval_path: str | Path, submission_path: str | Path, out_path: str | Path, seed: str, rows: int, keyring_path: str | Path | None = None) -> dict[str, Any]:
@@ -126,8 +108,22 @@ def audit_submission(config_path: str | Path, eval_path: str | Path, submission_
     submission = load_json(submission_path)
     keyring = load_json(keyring_path) if keyring_path else None
     errors = verify_submission_structure(config, eval_rows, submission, keyring)
-    selected = choose_audit_rows(submission, seed, rows)
-    prompt_by_id = {row["row_id"]: row["prompt"] for row in eval_rows}
+    eval_by_id = {row["row_id"]: row for row in eval_rows}
+    tolerance = config.get("reward", {}).get("numeric_tolerance", 1e-6)
+    correct_row_ids = {
+        str(row["row_id"])
+        for row in submission.get("rows", [])
+        if reward_for_row(row.get("answer", ""), eval_by_id.get(row["row_id"], {}), tolerance) == 1
+    }
+    selected = choose_audit_rows(
+        submission,
+        seed,
+        rows,
+        correct_row_ids=correct_row_ids,
+    )
+    if not selected:
+        errors.append("submission has no correct rows to audit")
+    prompt_by_id = {row_id: row["prompt"] for row_id, row in eval_by_id.items()}
     submitted_by_id = {row["row_id"]: row for row in submission.get("rows", [])}
     adapter_path = submission.get("adapter_path")
     failures: list[dict[str, Any]] = []

@@ -46,15 +46,18 @@ the SHA-256 digest of all 10,000 ordered rollout rows.
 Generation is deterministic greedy decoding under a miner-selected limit from
 1 through 32,768 tokens. Validators enforce the manifest's exact limit and the
 code-pinned 32,768-token combined prompt-and-response context. After a future
-finalized block makes the sample unpredictable, validators teacher-force 32
-distinct rows per round through the committed adapter. The 256 MiB aggregate
+finalized block makes the sample unpredictable, validators teacher-force up to
+32 distinct correctly answered rows per round through the committed adapter.
+Incorrect rows cannot improve a miner's score and are excluded from the audit
+population. The 256 MiB aggregate
 bundle cap prevents miners from turning flexible generation budgets into an
 unbounded download. Every submitted token must rank within the top three and
 remain within a 0.25 logprob gap; at least 99.5% of audited tokens must still
-be exact rank one. Ten successful rounds cover 320 distinct rows before
-eligibility; twenty rounds continue monitoring the same immutable revision.
-With 100 forged rows among 10,000, 320 samples without
-replacement detect at least one with probability 96.19%.
+be exact rank one. Ten successful rounds normally cover 320 distinct correct
+rows before eligibility; smaller correct populations are fully covered sooner.
+Twenty rounds continue monitoring the same immutable revision when enough
+correct rows exist. Sampling 320 rows detects at least one when 1% of the
+score-contributing population is forged with at least 95% probability.
 
 This is strong statistical evidence that the sampled traces are greedy outputs
 of the committed model. It is not a cryptographic proof that every unaudited
@@ -80,14 +83,18 @@ reviewed protocol release adopted by validators and miners.
 
 The math verifier intentionally accepts only complete, strictly parsed integer,
 decimal, and fraction answers. Symbolic algebra and proof answers in the wider
-NVIDIA math dataset are filtered out. This is safe and fast, but it is not a
-replacement for NVIDIA NeMo-Skills' full symbolic math grading.
+NVIDIA math dataset are filtered out. CrossThink prompts that visibly request
+multiple answers are also excluded because their scalar label is ambiguous.
+This is safe and fast, but it is not a replacement for NVIDIA NeMo-Skills' full
+symbolic math grading.
 
-Instruction scoring implements binary all-constraints-pass grading for a
-reviewed local subset of NVIDIA's verifiable-instruction identifiers. It does
-not import or execute verifier code from the dataset or a miner. Unsupported,
-malformed, non-binary, suspicious, URL-bearing, secret-requesting, or
-command-like prompts are excluded deterministically.
+MCQA grading uses reviewed local patterns and, where the source supplies them,
+requires declared option keys to agree with the rendered prompt. Code-output
+ground truths are read from bounded inert syntax trees and responses must be a
+complete one-field JSON object. Dataset-supplied code, regular expressions,
+templates, metadata, and program snippets are never evaluated, compiled,
+imported, or executed. Unsupported, malformed, suspicious, URL-bearing,
+secret-requesting, or command-like prompts are excluded deterministically.
 
 ## Current commitments and rewards
 

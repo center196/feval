@@ -36,7 +36,8 @@ from ..protocol.schedule import evaluation_seed
 from .sources import JsonlSource, ParquetSource, Source, describe_source, iter_source_blocks
 from .tasks import NORMALIZERS, REQUIRED_MCQA_OPTIONS
 
-PROTOCOL_EVALUATION_MANIFEST = "feval-dataset-manifest-v4"
+PROTOCOL_EVALUATION_MANIFEST = "feval-dataset-manifest-v5"
+PROTOCOL_TASK_NORMALIZATION = "feval-task-normalization-v2"
 
 VERIFIERS = ("strict_numeric", "mcqa_letter", "json_output_exact")
 GUESS_RESISTANT_VERIFIERS = frozenset({"strict_numeric", "json_output_exact"})
@@ -241,6 +242,7 @@ def build_evaluation_window(
         )
     manifest = {
         "protocol": PROTOCOL_EVALUATION_MANIFEST,
+        "normalization_protocol": PROTOCOL_TASK_NORMALIZATION,
         "kind": "evaluation_window",
         "candidate_source": "seeded_row_groups",
         "base_model": BASE_MODEL,
@@ -262,6 +264,7 @@ def build_evaluation_window(
         "filter_hash": hash_json(
             {
                 "base_model": BASE_MODEL,
+                "normalization_protocol": PROTOCOL_TASK_NORMALIZATION,
                 "max_prompt_chars": max_prompt_chars,
                 "verifiers": list(VERIFIERS),
                 "required_mcqa_options": REQUIRED_MCQA_OPTIONS,

@@ -303,7 +303,6 @@ _BOXED_LETTER = re.compile(r"\\(?:boxed|text|mathrm)\s*\{\s*([A-Za-z])\s*\}")
 # "the answer is complicated" cannot be mined for a stray option letter.
 _ANSWER_LETTER = re.compile(r"(?i)\banswer\s*[:\-]?\s*\(?\s*([A-Za-z])(?![A-Za-z])")
 _BARE_LETTER = re.compile(r"[^A-Za-z0-9]*([A-Za-z])[^A-Za-z0-9]*")
-_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
 
 
 def extract_mcqa_letter(answer: Any) -> str | None:
@@ -335,15 +334,6 @@ def reward_mcqa_letter(answer: Any, expected: Any) -> int:
     return int(any(letter == str(value).strip().upper() for value in values))
 
 
-def _json_candidates(text: str) -> list[str]:
-    candidates = [text]
-    candidates.extend(match.strip() for match in _FENCE.findall(text))
-    start, end = text.find("{"), text.rfind("}")
-    if 0 <= start < end:
-        candidates.append(text[start : end + 1])
-    return candidates
-
-
 def extract_json_output(answer: Any) -> str | None:
     """Return the ``output`` field of a predicted-output response.
 
@@ -355,24 +345,23 @@ def extract_json_output(answer: Any) -> str | None:
     probe = str(answer).strip()
     if not probe:
         return None
-    for candidate in _json_candidates(probe):
-        try:
-            value = json.loads(candidate)
-        except (ValueError, TypeError):
-            continue
-        if isinstance(value, dict) and isinstance(value.get("output"), str):
-            return value["output"]
+    try:
+        value = json.loads(probe)
+    except (ValueError, TypeError):
+        return None
+    if (
+        isinstance(value, dict)
+        and set(value) == {"output"}
+        and isinstance(value.get("output"), str)
+    ):
+        return value["output"]
     return None
 
 
 def reward_json_output_exact(answer: Any, expected: Any) -> int:
     values = [str(value) for value in (expected if isinstance(expected, list) else [expected])]
     output = extract_json_output(answer)
-    if output is not None and any(output == value for value in values):
-        return 1
-    # A bare response is accepted only when it matches byte for byte. The
-    # wrapper is forgiven; a single wrong space is not.
-    return int(any(str(answer) == value for value in values))
+    return int(output is not None and any(output == value for value in values))
 
 
 def reward_answer(answer: Any, expected: Any, tolerance: float = 1e-6, verifier: str = "exact_or_numeric") -> int:
@@ -400,5 +389,4 @@ def reward_for_row(answer: Any, row: dict[str, Any], tolerance: float = 1e-6) ->
     if verifier == "instruction_constraints":
         return reward_instruction_constraints(answer, row.get("constraints", []))
     return reward_answer(answer, row.get("expected"), tolerance, verifier)
-
 

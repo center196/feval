@@ -191,6 +191,8 @@ def _normalize_state(state: Any) -> dict[str, Any]:
         "feval-validator-state-v29",
         "feval-validator-state-v30",
         "feval-validator-state-v31",
+        "feval-validator-state-v32",
+        "feval-validator-state-v33",
     }:
         # Audit semantics changed. Never carry old pass/fail decisions or
         # partial rounds into a different token-validity protocol.
@@ -521,6 +523,7 @@ def _load_miner_rollout_state(work_dir: str | Path) -> dict[str, Any]:
         "feval-miner-rollout-state-v13",
         "feval-miner-rollout-state-v14",
         "feval-miner-rollout-state-v15",
+        "feval-miner-rollout-state-v16",
     }:
         return {"protocol": PROTOCOL_MINER_ROLLOUT_STATE, "last_success": None}
     if not isinstance(state, dict) or state.get("protocol") != PROTOCOL_MINER_ROLLOUT_STATE:
@@ -838,6 +841,12 @@ def score_rollouts(
         scored.append({**rollout, "tokens": tokens, "reward": reward})
     score = sum(row["reward"] for row in scored) / len(scored) if scored else 0.0
     return score, scored
+
+
+def _correct_scored_rows(scored: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return only rows whose locally verified answer contributes to score."""
+
+    return [row for row in scored if int(row.get("reward", 0)) == 1]
 
 
 def _scratch_root(work_dir: Path) -> Path:
@@ -1203,6 +1212,9 @@ class ValidatorRunner:
                     round_score = score
                     round_correct = sum(int(row["reward"]) for row in scored)
                     round_row_count = len(scored)
+                    correct_scored = _correct_scored_rows(scored)
+                    if not correct_scored:
+                        raise ValueError("rollout has no correct rows to audit")
                     timings["local_validation_score"] = round(time.monotonic() - stage_started, 3)
                     audit_key = (
                         f"{hotkey}:{commitment.model_digest}:{rollout_revision}:{window}"
@@ -1234,7 +1246,7 @@ class ValidatorRunner:
                         round_number=int(pending["round"]),
                     )
                     selected_ids = choose_audit_ids(
-                        scored,
+                        correct_scored,
                         seed=seed,
                         count=self.config.audit_rows_per_round,
                         already_audited=audited_rows,
@@ -1245,7 +1257,7 @@ class ValidatorRunner:
                     eval_by_id = {row["row_id"]: row for row in eval_rows}
                     audit_rows = [
                         {**row, "prompt": eval_by_id[row["row_id"]]["prompt"]}
-                        for row in scored
+                        for row in correct_scored
                         if row["row_id"] in selected
                     ]
                     stage_started = time.monotonic()
@@ -1288,14 +1300,14 @@ class ValidatorRunner:
                 if audit_valid:
                     progress["rounds_passed"] = int(progress.get("rounds_passed", 0)) + 1
                 required_rounds = required_audit_rounds(
-                    population=len(scored),
+                    population=len(correct_scored),
                     rows_per_round=self.config.audit_rows_per_round,
                     min_fake_fraction=self.config.audit_min_fake_row_fraction,
                     confidence=self.config.audit_detection_confidence,
                 )
                 total_rounds = min(
                     self.config.audit_total_rounds,
-                    (len(scored) + self.config.audit_rows_per_round - 1)
+                    (len(correct_scored) + self.config.audit_rows_per_round - 1)
                     // self.config.audit_rows_per_round,
                 )
                 rounds_passed = int(progress.get("rounds_passed", 0))
@@ -1591,6 +1603,8 @@ class ValidatorRunner:
                 (self.config.evaluation_rows + self.config.audit_rows_per_round - 1)
                 // self.config.audit_rows_per_round,
             )
+            if isinstance(previous, dict) and previous.get("audit_total_rounds") is not None:
+                total_rounds = int(previous["audit_total_rounds"])
             previous_round = int(previous.get("audit_round", 0)) if isinstance(previous, dict) else 0
             if (
                 isinstance(previous, dict)

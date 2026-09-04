@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 
-PROTOCOL_NETWORK = "feval-network-v34"
+PROTOCOL_NETWORK = "feval-network-v36"
 PROTOCOL_MODEL_COMMITMENT = "f3"
 PROTOCOL_MODEL_MANIFEST = "feval-model-v4"
-PROTOCOL_ROLLOUT_MANIFEST = "feval-rollouts-v18"
-PROTOCOL_VALIDATOR_STATE = "feval-validator-state-v32"
-PROTOCOL_MINER_ROLLOUT_STATE = "feval-miner-rollout-state-v16"
+PROTOCOL_ROLLOUT_MANIFEST = "feval-rollouts-v19"
+PROTOCOL_VALIDATOR_STATE = "feval-validator-state-v34"
+PROTOCOL_MINER_ROLLOUT_STATE = "feval-miner-rollout-state-v17"
 
 SUBNET_NETUID = 47
 PUBLIC_WANDB_ENTITY = "feval196-feval"
@@ -76,6 +76,7 @@ EVALUATION_SOURCES: tuple[dict, ...] = (
             "expected_answer",
             "uuid",
             "template_metadata",
+            "options",
         ),
         "verifier": "mcqa_letter",
         "license": "cc-by-4.0",
@@ -119,13 +120,11 @@ DATASET_WINDOW_BLOCKS = 2 * 24 * 60 * 5
 WEIGHT_INTERVAL_BLOCKS = 150
 AUDIT_DELAY_BLOCKS = 5
 AUDIT_ROWS_PER_ROUND = 32
-# A miner submits 10K rows. Thirty-two distinct uniformly random rows are
-# checked per round. Ten successful rounds check 320 rows and provide at least
-# a 95% conservative guarantee (96.19% exact without-replacement detection)
-# when 1% or more are forged.
-# Align the audit threat model with the smallest score movement that can clear
-# the king-promotion margin. Fabricating fewer rows cannot create a full margin
-# from an otherwise tied model.
+# Only correctly answered rows can contribute to a miner's score, so audit
+# sampling is restricted to that population. Thirty-two distinct correct rows
+# are checked per round. Ten successful rounds check 320 rows and provide at
+# least a 95% conservative guarantee when 1% or more of the score-contributing
+# rows are forged. Incorrect rows cannot improve a miner's score.
 AUDIT_MIN_FAKE_ROW_FRACTION = PROMOTION_DELTA_MIN
 AUDIT_DETECTION_CONFIDENCE = 0.95
 # Ten successful rounds make a revision eligible for emission. Continue

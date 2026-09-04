@@ -1,11 +1,10 @@
 """Per-source normalisation into one protocol-owned evaluation row.
 
 Every source ships its own prompt template, its own answer wrapper, and its own
-grading conventions. None of those are used at evaluation time. Each source row
-is reduced to a bare question plus a machine-checkable expected value, and Feval
-then builds the prompt and picks the verifier. That keeps one output contract
-across all five sources and stops a source's embedded chat template from
-nesting inside the protocol's own.
+grading conventions. Each source row is reduced to a bare question plus a
+machine-checkable expected value, and Feval then builds the prompt and picks a
+reviewed local verifier with equivalent answer semantics. Source-provided code,
+regular expressions, and verifier metadata are never compiled or executed.
 
 Only three verifiers exist, and all three are pure string work:
 
@@ -45,7 +44,8 @@ CODE_OUTPUT_SUFFIX = (
 REQUIRED_MCQA_OPTIONS = 10
 MCQA_LETTERS = tuple("ABCDEFGHIJ")
 
-_OPTION_LINE = re.compile(r"(?m)^([A-Z])[:.]\s")
+_OPTION_LINE = re.compile(r"(?m)^[ \t]*([A-Z])(?:[:.]|\))[ \t]+")
+_NUMBERED_PART = re.compile(r"(?m)^[ \t]*\d+[.)][ \t]+")
 # OpenScienceReasoning-2 stores its answer bare in some row groups and
 # LaTeX-wrapped in others. Both encodings name the same option letter.
 _WRAPPED_LETTER = re.compile(
@@ -74,9 +74,9 @@ _STRIP_SUFFIXES = (
     "Return your response as a json with a field 'output' that contains the "
     "predicted output string.",
 )
-# ``verification_info`` arrives as a Python repr, not JSON. ``literal_eval``
-# parses literals only and never executes code; the bound keeps a pathological
-# pinned value from exhausting the parser.
+# ``verification_info`` arrives as a Python repr, not JSON. It is parsed into an
+# AST and only a literal string node at the reviewed key is read. The AST is
+# never compiled or executed, and the bound limits parser resource use.
 MAX_LITERAL_BYTES = 64 * 1024
 
 
@@ -138,30 +138,90 @@ def _content_id(text: str) -> str:
     return hashlib.sha256(str(text).encode("utf-8")).hexdigest()[:20]
 
 
-def _literal_dict(value: Any) -> dict[str, Any]:
+def _static_string_field(value: Any, field: str) -> str | None:
+    """Read one string field from a dict or Python-dict representation.
+
+    ``ast.parse`` builds inert syntax nodes. This function accepts only a
+    constant string key paired with a constant string value and never calls
+    ``eval``, ``literal_eval``, ``compile``, or any dataset-supplied callable.
+    """
+
     if isinstance(value, dict):
-        return value
+        result = value.get(field)
+        return result if isinstance(result, str) else None
     if not isinstance(value, str) or len(value) > MAX_LITERAL_BYTES:
-        return {}
+        return None
     try:
-        parsed = ast.literal_eval(value)
-    except (ValueError, SyntaxError, MemoryError, RecursionError):
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
+        parsed = ast.parse(value, mode="eval")
+    except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError):
+        return None
+    body = parsed.body
+    if not isinstance(body, ast.Dict):
+        return None
+    matches: list[str] = []
+    for key_node, value_node in zip(body.keys, body.values):
+        if (
+            isinstance(key_node, ast.Constant)
+            and key_node.value == field
+            and isinstance(value_node, ast.Constant)
+            and isinstance(value_node.value, str)
+        ):
+            matches.append(value_node.value)
+    return matches[0] if len(matches) == 1 else None
 
 
 def _option_letters(text: str) -> set[str]:
     return {match.group(1) for match in _OPTION_LINE.finditer(text)}
 
 
+def _declared_option_letters(value: Any) -> set[str] | None:
+    """Read populated option keys from the source's inert ``options`` value."""
+
+    if not isinstance(value, list) or not 1 <= len(value) <= 26:
+        return None
+    letters: list[str] = []
+    for item in value:
+        if not isinstance(item, dict):
+            return None
+        populated = [
+            str(key).strip().upper()
+            for key, option in item.items()
+            if isinstance(option, str) and option.strip()
+        ]
+        if len(populated) != 1:
+            return None
+        letter = populated[0]
+        if len(letter) != 1 or letter not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            return None
+        letters.append(letter)
+    if len(set(letters)) != len(letters):
+        return None
+    return set(letters)
+
+
+def _single_answer_question(text: str) -> bool:
+    """Conservatively reject prompts that visibly request multiple answers."""
+
+    question_marks = text.count("?") + text.count("？")
+    return question_marks <= 1 and len(_NUMBERED_PART.findall(text)) <= 1
+
+
 def _mcqa_row(
-    *, row_id: str, question: str, answer: str, source: str, license_id: str | None
+    *,
+    row_id: str,
+    question: str,
+    answer: str,
+    source: str,
+    license_id: str | None,
+    declared_letters: set[str] | None = None,
 ) -> dict[str, Any] | None:
     letters = _option_letters(question)
     if letters != set(MCQA_LETTERS):
         return None
+    if declared_letters is not None and declared_letters != letters:
+        return None
     letter = _unwrap_letter(answer)
-    if letter is None or letter not in MCQA_LETTERS:
+    if letter is None or letter not in letters:
         return None
     return {
         "row_id": row_id,
@@ -219,7 +279,7 @@ def normalize_crossthink_math(row: dict[str, Any], index: int) -> dict[str, Any]
     if str(reward.get("style") or "") != "rule":
         return None
     question = _clean_question(metadata.get("question"))
-    if question is None:
+    if question is None or not _single_answer_question(question):
         return None
     return _math_row(
         row_id=f"math:crossthink:{metadata.get('index', index)}",
@@ -245,12 +305,16 @@ def normalize_knowledge_mcqa(row: dict[str, Any], index: int) -> dict[str, Any] 
     )
     if question is None:
         return None
+    declared_letters = _declared_option_letters(row.get("options"))
+    if declared_letters is None:
+        return None
     return _mcqa_row(
         row_id=f"mcqa:knowledge:{row.get('uuid') or index}",
         question=question,
         answer=row.get("expected_answer"),
         source="nvidia/Nemotron-RL-knowledge-mcqa",
         license_id="cc-by-4.0",
+        declared_letters=declared_letters,
     )
 
 
@@ -268,8 +332,7 @@ def normalize_open_science(row: dict[str, Any], index: int) -> dict[str, Any] | 
 
 
 def normalize_code_understanding(row: dict[str, Any], index: int) -> dict[str, Any] | None:
-    info = _literal_dict(row.get("verification_info"))
-    truth = info.get("ground_truth")
+    truth = _static_string_field(row.get("verification_info"), "ground_truth")
     # An empty expected output is guessable and carries no signal.
     if not isinstance(truth, str) or not truth:
         return None

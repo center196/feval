@@ -177,10 +177,14 @@ The three verifiers are:
   `Fraction` equality. Expressions, variables, and prose are rejected rather
   than approximated.
 - `mcqa_letter` compares one option letter. Only ten-option questions are kept,
-  so blind guessing is worth 10% on these rows rather than 25%.
-- `json_output_exact` compares a predicted program output byte for byte,
-  including leading and trailing whitespace. The program is never run; the
-  expected output ships with the pinned revision.
+  and Knowledge-MCQA's declared option keys must agree with the options rendered
+  in the prompt. Static local parsing accepts the source layouts `A:`, `A.`, and
+  `A)`; source-provided regular expressions are never compiled. Blind guessing
+  is therefore worth 10% on these rows rather than 25%.
+- `json_output_exact` requires one complete JSON object with exactly one string
+  field named `output`, then compares that field byte for byte, including its
+  leading and trailing whitespace. The program is never run; the expected
+  output ships with the pinned revision.
 
 6,500 of the 10,000 rows use a verifier where guessing is worthless, and the
 protocol refuses to build a window that falls below that floor. A miner that
@@ -188,7 +192,10 @@ answers every row with the single most common option letter scores about 6%.
 
 Each source keeps its own answer conventions out of the prompt: Feval extracts
 the bare question, supplies its own output instruction, and drops any row whose
-text still carries a competing format instruction.
+text still carries a competing format instruction. CrossThink rows that visibly
+request multiple answers are also dropped because one scalar ground-truth field
+cannot grade them unambiguously. Dataset text and metadata are handled only as
+bounded data: they are never evaluated, compiled, imported, or executed.
 
 Production commands cannot replace those datasets or reduce the row count.
 Miners select `--max-new-tokens` from 1 through 32,768; validators read the
@@ -198,11 +205,13 @@ row is the smaller of the miner's choice and the context remaining after its
 fixed prompt. A 256 MiB total bundle cap prevents miners from imposing
 multi-gigabyte downloads. Dataset, verifier, and context changes are manual
 protocol upgrades; `sources_digest` in the network config pins every repository,
-revision, file, column, verifier, and row quota as one value. Validators score all rows locally, then verify unpredictable samples
-against the committed adapter using bounded
+revision, file, column, verifier, and row quota as one value. Validators score
+all rows locally, then verify unpredictable samples drawn only from correctly
+answered rows against the committed adapter using bounded
 greedy-token checks. Every token must be within the top three and a 0.25
-logprob gap, while at least 99.5% must be exact rank one. Eligibility requires
-10 successful rounds of 32 distinct rows; auditing continues for 20 rounds.
+logprob gap, while at least 99.5% must be exact rank one. Eligibility normally
+requires 10 successful rounds of 32 distinct correct rows; smaller correct
+populations are fully covered sooner, and auditing continues for up to 20 rounds.
 Validators consider only currently registered miners with valid Feval
 metadata. Exact model and exact full-rollout copies belong to the earlier
 current commitment block, with the hotkey as a deterministic same-block tie
@@ -224,7 +233,7 @@ Feval has two operating roles only:
 - Miners commit models on chain and publish immutable model and rollout data.
 - Validators independently read finalized chain state, derive each evaluation
   set from seeded row groups of the pinned public dataset revisions, audit
-  miners, and submit weights.
+  miners by sampling only score-contributing correct rows, and submit weights.
 
 There is no third operational service, privileged protocol key, miner allowlist,
 or centrally supplied launch configuration. The finalized chain, immutable source
