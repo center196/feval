@@ -772,6 +772,32 @@ def _commitment_result_fields(
     return {"model_repo": None, "model_revision": None, "rollout_repo": None}
 
 
+def _wandb_run_id_is_unusable(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "previously created and deleted" in message or (
+        "run id" in message and "is in use" in message
+    )
+
+
+def _reset_wandb_sdk_session() -> None:
+    """Clear a partial global W&B session left behind by a failed init."""
+
+    try:
+        import wandb
+    except ImportError:
+        return
+    try:
+        active_run = getattr(wandb, "run", None)
+        if active_run is not None:
+            active_run.finish()
+        else:
+            finish = getattr(wandb, "finish", None)
+            if callable(finish):
+                finish()
+    except Exception:
+        pass
+
+
 def score_rollouts(
     eval_rows: list[dict[str, Any]],
     rollout_rows: list[dict[str, Any]],
@@ -1656,17 +1682,22 @@ class ValidatorRunner:
                 validator_hotkey=self._validator_hotkey(),
             )
             summary_root = str(manifest["summary_root"])
-            if self.state.get("last_wandb_summary_root") == summary_root:
+            if (
+                self.state.get("last_wandb_summary_root") == summary_root
+                and self.wandb_run is not None
+                and self.wandb_run_window == self.state.get("window")
+            ):
                 return {"status": "unchanged", "summary_root": summary_root}
             window = int(self.state.get("window"))
             if self.wandb_run is None or self.wandb_run_window != window:
                 self._close_wandb_run()
                 validator_hotkey = self._validator_hotkey()
-                if (
-                    self.state.get("wandb_run_window") != window
-                    or not isinstance(self.state.get("wandb_run_id"), str)
-                    or not self.state.get("wandb_run_id")
-                ):
+                resuming_existing = (
+                    self.state.get("wandb_run_window") == window
+                    and isinstance(self.state.get("wandb_run_id"), str)
+                    and bool(self.state.get("wandb_run_id"))
+                )
+                if not resuming_existing:
                     self.state["wandb_run_id"] = secrets.token_hex(16)
                     self.state["wandb_run_window"] = window
                     _atomic_write_json(self.state_path, self.state)
@@ -1676,11 +1707,26 @@ class ValidatorRunner:
                     if len(validator_hotkey) <= 20
                     else f"{validator_hotkey[:8]}-{validator_hotkey[-6:]}"
                 )
-                self.wandb_run = start_wandb_results_run(
-                    bundle_dir=out_dir,
-                    run_name=f"feval-{short_validator}-window-{window}",
-                    run_id=run_id,
-                )
+                run_name = f"feval-{short_validator}-window-{window}"
+                try:
+                    self.wandb_run = start_wandb_results_run(
+                        bundle_dir=out_dir,
+                        run_name=run_name,
+                        run_id=run_id,
+                    )
+                except Exception as exc:
+                    if not resuming_existing or not _wandb_run_id_is_unusable(exc):
+                        raise
+                    _reset_wandb_sdk_session()
+                    self.state["wandb_run_id"] = secrets.token_hex(16)
+                    self.state["wandb_run_window"] = window
+                    self.state.pop("last_wandb_summary_root", None)
+                    _atomic_write_json(self.state_path, self.state)
+                    self.wandb_run = start_wandb_results_run(
+                        bundle_dir=out_dir,
+                        run_name=run_name,
+                        run_id=self.state["wandb_run_id"],
+                    )
                 self.wandb_run_window = window
             report = log_results_to_wandb(
                 bundle_dir=out_dir,
@@ -1692,6 +1738,11 @@ class ValidatorRunner:
         except Exception as exc:
             # W&B is a public convenience mirror, never a validator dependency.
             self._close_wandb_run()
+            if _wandb_run_id_is_unusable(exc):
+                _reset_wandb_sdk_session()
+                self.state["wandb_run_id"] = None
+                self.state.pop("last_wandb_summary_root", None)
+                _atomic_write_json(self.state_path, self.state)
             return {"status": "unavailable", "error": f"{type(exc).__name__}: {exc}"}
 
     def cycle(self) -> dict[str, Any]:
