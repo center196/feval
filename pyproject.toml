@@ -11,6 +11,7 @@ dependencies = [
   "bittensor==11.1.0",
   "datasets==5.0.1",
   "huggingface-hub==1.28.0",
+  "pyarrow>=17,<23",
   "safetensors==0.8.0",
   "transformers==5.15.0",
   "typer==0.27.1",

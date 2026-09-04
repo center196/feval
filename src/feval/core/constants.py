@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 
-PROTOCOL_NETWORK = "feval-network-v33"
+PROTOCOL_NETWORK = "feval-network-v34"
 PROTOCOL_MODEL_COMMITMENT = "f3"
 PROTOCOL_MODEL_MANIFEST = "feval-model-v4"
-PROTOCOL_ROLLOUT_MANIFEST = "feval-rollouts-v17"
-PROTOCOL_VALIDATOR_STATE = "feval-validator-state-v31"
-PROTOCOL_MINER_ROLLOUT_STATE = "feval-miner-rollout-state-v15"
+PROTOCOL_ROLLOUT_MANIFEST = "feval-rollouts-v18"
+PROTOCOL_VALIDATOR_STATE = "feval-validator-state-v32"
+PROTOCOL_MINER_ROLLOUT_STATE = "feval-miner-rollout-state-v16"
 
 SUBNET_NETUID = 47
 PUBLIC_WANDB_ENTITY = "feval196-feval"
@@ -35,15 +35,84 @@ BASE_KEY_VALUE_SIZE = 1_024
 BASE_INTERMEDIATE_SIZE = 9_728
 BASE_NUM_HIDDEN_LAYERS = 36
 
-MATH_DATASET = "nvidia/Nemotron-SFT-Math-v4"
-INSTRUCTION_DATASET = "nvidia/Nemotron-RL-instruction_following"
-# Immutable source snapshots. Changing either is a subnet protocol upgrade.
-MATH_DATASET_REVISION = "84d42ad0cb960f07f951b9baa9ed2b46a5a18c66"
-INSTRUCTION_DATASET_REVISION = "3b253899665cb71334bb54c14eb5d91751beaad7"
+# Immutable evaluation sources. Every entry is pinned to a full commit SHA and
+# to the exact files and columns Feval is allowed to read, so each node fetches
+# byte-identical input. Changing any field is a subnet protocol upgrade.
+#
+# Only tasks a validator can settle with pure string work are listed. There is
+# no model judge, no symbolic algebra, and no execution of dataset or model
+# code anywhere in the grading path.
+EVALUATION_SOURCES: tuple[dict, ...] = (
+    {
+        "name": "open_math_reasoning",
+        "kind": "parquet",
+        "repo": "nvidia/OpenMathReasoning",
+        "revision": "d3d08664755704f422af97d43a7ff0ded4bd95df",
+        "files": tuple(f"data/cot-{index:05d}-of-00144.parquet" for index in range(144)),
+        "columns": ("problem", "expected_answer", "problem_type"),
+        "verifier": "strict_numeric",
+        "license": "cc-by-4.0",
+        "rows": 3_000,
+    },
+    {
+        "name": "crossthink_math",
+        "kind": "jsonl",
+        "repo": "nvidia/Nemotron-CrossThink",
+        "revision": "a4ce9a3b9434c5f231e2cbe30696d9a721c11d69",
+        "files": ("Data/Nemotron-CrossThink-Math.jsonl",),
+        "columns": (),
+        "verifier": "strict_numeric",
+        "license": "cc-by-4.0",
+        "rows": 1_500,
+    },
+    {
+        "name": "knowledge_mcqa",
+        "kind": "parquet",
+        "repo": "nvidia/Nemotron-RL-knowledge-mcqa",
+        "revision": "62a1eec1f952723eab2ee3832222f533b8138067",
+        "files": tuple(f"data/train-{index:05d}-of-00004.parquet" for index in range(4)),
+        "columns": (
+            "responses_create_params",
+            "expected_answer",
+            "uuid",
+            "template_metadata",
+        ),
+        "verifier": "mcqa_letter",
+        "license": "cc-by-4.0",
+        "rows": 2_000,
+    },
+    {
+        "name": "open_science",
+        "kind": "parquet",
+        "repo": "nvidia/OpenScienceReasoning-2",
+        "revision": "174b02c9cdf231f220765b2a1d5ece4550921894",
+        "files": ("train/OpenScienceReasoning-2.parquet",),
+        # 'output' holds a long reasoning trace Feval never reads. Omitting it
+        # takes a row group from 1.9 GB to about 133 MB on the wire.
+        "columns": ("expected_answer", "input"),
+        "verifier": "mcqa_letter",
+        "license": "cc-by-4.0",
+        "rows": 1_500,
+    },
+    {
+        "name": "code_understanding",
+        "kind": "parquet",
+        "repo": "PrimeIntellect/synthetic-code-understanding",
+        "revision": "106a1cec075ae29b8dc07e355a29ddce2cf0745b",
+        "files": ("data/train-00000-of-00001.parquet",),
+        "columns": ("problem_id", "prompt", "verification_info"),
+        "verifier": "json_output_exact",
+        # Apache-2.0 through PrimeIntellect/SYNTHETIC-1, which names this repo
+        # in its own hf_dataset_name column. See THIRD_PARTY_NOTICES.md.
+        "license": "apache-2.0",
+        "rows": 2_000,
+    },
+)
 
 EVALUATION_ROWS = 10_000
-MATH_ROWS = 5_000
-INSTRUCTION_ROWS = 5_000
+# Rows whose answer space makes blind guessing worthless. Keeping this the
+# clear majority bounds the score a miner can reach without a real model.
+GUESS_RESISTANT_ROWS = 6_500
 # Keep each deterministic 10,000-row evaluation set active for approximately
 # two days at Bittensor's target of one finalized block every 12 seconds.
 DATASET_WINDOW_BLOCKS = 2 * 24 * 60 * 5
@@ -114,3 +183,24 @@ ALLOWED_LORA_TARGET_MODULES = frozenset(
         "down_proj",
     }
 )
+
+
+def _sources_digest() -> str:
+    """Pin the whole source table so a local config cannot rewrite one field."""
+
+    import hashlib
+
+    from ..utils.jsonutil import canonical_json_bytes
+
+    return hashlib.sha256(
+        canonical_json_bytes(
+            [
+                {key: list(value) if isinstance(value, tuple) else value
+                 for key, value in sorted(spec.items())}
+                for spec in EVALUATION_SOURCES
+            ]
+        )
+    ).hexdigest()
+
+
+EVALUATION_SOURCES_DIGEST = _sources_digest()

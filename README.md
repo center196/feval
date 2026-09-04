@@ -33,10 +33,14 @@ Set `HF_TOKEN` on miner hosts that upload to Hugging Face. Validators do not
 need a Hugging Face token when model and rollout repositories are public.
 Never commit `.env`, wallet files, private keys, tokens, or validator state.
 
-Each two-day window selects its 10,000 rows from all valid rows in both pinned
-public Hugging Face datasets. The first cycle for a window reports source-scan
-progress while preparing the local evaluation cache; the unauthenticated-request
-warning is harmless for public repositories.
+Each two-day window draws its 10,000 rows from five pinned public Hugging Face
+datasets. Sources are never downloaded whole: parquet footers give a row-group
+map for free, and the window seed picks which row groups (or, for a JSONL
+source, which byte blocks) to read, fetching only the columns Feval grades on.
+Building a window transfers a few hundred megabytes rather than tens of
+gigabytes, and takes roughly a minute and a half. The first cycle for a window
+reports per-source scan progress; the unauthenticated-request warning is
+harmless for public repositories.
 
 ## Repository layout
 
@@ -46,7 +50,7 @@ warning is harmless for public repositories.
 |   +-- cli/          # Command-line interface
 |   +-- core/         # Network config and protocol constants
 |   +-- protocol/     # Deterministic seeds, Merkle roots, and submissions
-|   +-- datasets/     # Dataset loading, filtering, and scoring
+|   +-- datasets/     # Source sampling, task normalisation, and verifiers
 |   +-- models/       # LoRA artifacts, rollout generation, and inference
 |   +-- chain/        # Bittensor commitments, axon serving, and weights
 |   +-- nodes/        # Miner and validator runtime loops
@@ -154,17 +158,37 @@ Check liveness with `feval health --state validator-state.json`. See
 ## Evaluation protocol
 
 Every 14,400 finalized blocks (approximately two days), miners and validators
-derive the same 10,000-row evaluation set from immutable, code-pinned NVIDIA
-dataset revisions:
+derive the same 10,000-row evaluation set from immutable, code-pinned dataset
+revisions. Every row is settled by exact string comparison. There is no model
+judge, no symbolic algebra, and no execution of dataset or model code anywhere
+in the grading path.
 
-- 5,000 math rows whose expected answers can be safely verified as complete
-  integers, decimals, or fractions.
-- 5,000 instruction-following rows using binary all-constraints-pass grading
-  from a reviewed set of 30 local deterministic predicates.
+| Source | Rows | Verifier |
+| --- | --- | --- |
+| nvidia/OpenMathReasoning | 3,000 | `strict_numeric` |
+| nvidia/Nemotron-CrossThink | 1,500 | `strict_numeric` |
+| nvidia/Nemotron-RL-knowledge-mcqa | 2,000 | `mcqa_letter` |
+| nvidia/OpenScienceReasoning-2 | 1,500 | `mcqa_letter` |
+| PrimeIntellect/synthetic-code-understanding | 2,000 | `json_output_exact` |
 
-At the pinned instruction revision, 16,377 of 46,391 source rows pass the safe
-schema, constraint, and prompt filters, leaving substantial headroom above the
-5,000-row window requirement.
+The three verifiers are:
+
+- `strict_numeric` compares complete integers, decimals, and fractions by exact
+  `Fraction` equality. Expressions, variables, and prose are rejected rather
+  than approximated.
+- `mcqa_letter` compares one option letter. Only ten-option questions are kept,
+  so blind guessing is worth 10% on these rows rather than 25%.
+- `json_output_exact` compares a predicted program output byte for byte,
+  including leading and trailing whitespace. The program is never run; the
+  expected output ships with the pinned revision.
+
+6,500 of the 10,000 rows use a verifier where guessing is worthless, and the
+protocol refuses to build a window that falls below that floor. A miner that
+answers every row with the single most common option letter scores about 6%.
+
+Each source keeps its own answer conventions out of the prompt: Feval extracts
+the bare question, supplies its own output instruction, and drops any row whose
+text still carries a competing format instruction.
 
 Production commands cannot replace those datasets or reduce the row count.
 Miners select `--max-new-tokens` from 1 through 32,768; validators read the
@@ -172,8 +196,9 @@ rollout manifest and enforce that exact requested limit. Prompt plus response
 is always capped at 32,768 tokens, so the effective generation budget for each
 row is the smaller of the miner's choice and the context remaining after its
 fixed prompt. A 256 MiB total bundle cap prevents miners from imposing
-multi-gigabyte downloads. Dataset and context changes are manual protocol
-upgrades. Validators score all rows locally, then verify unpredictable samples
+multi-gigabyte downloads. Dataset, verifier, and context changes are manual
+protocol upgrades; `sources_digest` in the network config pins every repository,
+revision, file, column, verifier, and row quota as one value. Validators score all rows locally, then verify unpredictable samples
 against the committed adapter using bounded
 greedy-token checks. Every token must be within the top three and a 0.25
 logprob gap, while at least 99.5% must be exact rank one. Eligibility requires
@@ -184,11 +209,13 @@ current commitment block, with the hotkey as a deterministic same-block tie
 breaker. Replacing a commitment or leaving the current miner set removes its
 priority.
 
-The local math checker is deliberately narrower than NVIDIA's full symbolic
-math tooling, and the instruction checker implements only its reviewed safe
-subset. This keeps validation deterministic, inexpensive, and free of dataset
-code execution. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for dataset
-licenses and attribution obligations.
+The math checker is deliberately narrower than a full symbolic grader: it
+accepts only complete numeric answers, which drops most of the symbolic rows in
+the source datasets. That is the intended trade. It keeps validation
+deterministic across GPUs and runtimes, inexpensive, and free of dataset code
+execution, and it means two validators can never disagree about a score. See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for dataset licences and
+attribution obligations.
 
 ## Decentralization
 
@@ -196,8 +223,8 @@ Feval has two operating roles only:
 
 - Miners commit models on chain and publish immutable model and rollout data.
 - Validators independently read finalized chain state, derive each evaluation
-  set from all valid rows in the pinned public dataset revisions, audit miners,
-  and submit weights.
+  set from seeded row groups of the pinned public dataset revisions, audit
+  miners, and submit weights.
 
 There is no third operational service, privileged protocol key, miner allowlist,
 or centrally supplied launch configuration. The finalized chain, immutable source

@@ -26,7 +26,11 @@ from ..chain import (
 )
 from ..chain.champions import encode_reward_bits, update_champions, winner_weight_mapping
 from ..core.config import NetworkConfig, load_network_config
-from ..core.constants import PROTOCOL_MINER_ROLLOUT_STATE, PROTOCOL_VALIDATOR_STATE
+from ..core.constants import (
+    EVALUATION_SOURCES,
+    PROTOCOL_MINER_ROLLOUT_STATE,
+    PROTOCOL_VALIDATOR_STATE,
+)
 from ..datasets.dataset import PROTOCOL_EVALUATION_MANIFEST, prepare_window_from_config
 from ..models.hub import (
     resolve_rollout_revision,
@@ -186,6 +190,7 @@ def _normalize_state(state: Any) -> dict[str, Any]:
         "feval-validator-state-v28",
         "feval-validator-state-v29",
         "feval-validator-state-v30",
+        "feval-validator-state-v31",
     }:
         # Audit semantics changed. Never carry old pass/fail decisions or
         # partial rounds into a different token-validity protocol.
@@ -341,6 +346,7 @@ def ensure_evaluation_files(
     *,
     window: int,
     directory: str | Path,
+    token: str | bool | None = False,
 ) -> tuple[Path, Path, dict[str, Any]]:
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
@@ -351,31 +357,32 @@ def ensure_evaluation_files(
         if (
             manifest.get("protocol") == PROTOCOL_EVALUATION_MANIFEST
             and manifest.get("kind") == "evaluation_window"
-            and manifest.get("candidate_source") == "all_valid_rows"
+            and manifest.get("candidate_source") == "seeded_row_groups"
             and manifest.get("dataset_window") == window
             and manifest.get("evaluation_seed") == evaluation_seed(config.netuid, window)
             and manifest.get("evaluation_root") == root_for_values(load_jsonl(eval_path))
             and manifest.get("rows") == config.evaluation_rows
         ):
             return eval_path, manifest_path, manifest
+    quotas = {spec["name"]: int(spec["rows"]) for spec in EVALUATION_SOURCES}
     _validator_progress(
-        "building_evaluation_from_all_rows",
+        "building_evaluation_from_seeded_row_groups",
         authentication="public",
         target_rows=config.evaluation_rows,
+        sources=sorted(quotas),
     )
     manifest = prepare_window_from_config(
         config,
         window=window,
         out_path=eval_path,
         manifest_path=manifest_path,
-        progress=lambda task, scanned, selected: _validator_progress(
+        token=token,
+        progress=lambda source, scanned, selected: _validator_progress(
             "evaluation_source_progress",
-            task=task,
+            source=source,
             scanned=scanned,
             selected=selected,
-            target_selected=(
-                config.math_rows if task == "math" else config.instruction_rows
-            ),
+            target_selected=quotas.get(source),
         ),
     )
     _validator_progress(
@@ -457,6 +464,7 @@ def publish_miner_rollouts(
         config,
         window=window,
         directory=work / "evaluation",
+        token=hf_token or False,
     )
     bundle = work / "rollouts" / str(window)
     manifest = build_rollout_bundle_vllm(
@@ -512,6 +520,7 @@ def _load_miner_rollout_state(work_dir: str | Path) -> dict[str, Any]:
         "feval-miner-rollout-state-v12",
         "feval-miner-rollout-state-v13",
         "feval-miner-rollout-state-v14",
+        "feval-miner-rollout-state-v15",
     }:
         return {"protocol": PROTOCOL_MINER_ROLLOUT_STATE, "last_success": None}
     if not isinstance(state, dict) or state.get("protocol") != PROTOCOL_MINER_ROLLOUT_STATE:
@@ -623,6 +632,7 @@ class MinerRolloutRunner:
             self.config,
             window=window,
             directory=self.work_dir / "evaluation",
+            token=self.hf_token or False,
         )
         bundle = self.work_dir / "rollouts" / str(window)
         manifest = build_rollout_bundle_vllm(
@@ -1756,6 +1766,7 @@ class ValidatorRunner:
             self.config,
             window=window,
             directory=self.work_dir / "evaluation",
+            token=self.hf_token or False,
         )
         _validator_progress("reading_current_commitments", block=current_block)
         rows = _current_commitments(

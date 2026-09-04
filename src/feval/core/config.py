@@ -23,13 +23,8 @@ from .constants import (
     MINER_SHARE,
     DATASET_WINDOW_BLOCKS,
     EVALUATION_ROWS,
+    EVALUATION_SOURCES_DIGEST,
     INVALID_ROUNDS_BEFORE_BLACKLIST,
-    INSTRUCTION_DATASET,
-    INSTRUCTION_DATASET_REVISION,
-    INSTRUCTION_ROWS,
-    MATH_DATASET,
-    MATH_DATASET_REVISION,
-    MATH_ROWS,
     MAX_CONTEXT_TOKENS,
     MAX_LORA_RANK,
     MAX_OUTPUT_TOKENS,
@@ -49,14 +44,10 @@ class NetworkConfig:
     netuid: int = SUBNET_NETUID
     base_model: str = BASE_MODEL
     base_revision: str = BASE_MODEL_REVISION
-    math_dataset: str = MATH_DATASET
-    math_revision: str = MATH_DATASET_REVISION
-    instruction_dataset: str = INSTRUCTION_DATASET
-    instruction_revision: str = INSTRUCTION_DATASET_REVISION
-    split: str = "train"
+    # The evaluation sources are code-pinned as a table; this digest covers
+    # every repo, revision, file, column, verifier and quota in it.
+    sources_digest: str = EVALUATION_SOURCES_DIGEST
     evaluation_rows: int = EVALUATION_ROWS
-    math_rows: int = MATH_ROWS
-    instruction_rows: int = INSTRUCTION_ROWS
     dataset_window_blocks: int = DATASET_WINDOW_BLOCKS
     weight_interval_blocks: int = WEIGHT_INTERVAL_BLOCKS
     audit_delay_blocks: int = AUDIT_DELAY_BLOCKS
@@ -89,23 +80,15 @@ class NetworkConfig:
     def validate(self, *, production: bool = False) -> None:
         if self.protocol != PROTOCOL_NETWORK:
             raise ValueError(f"unsupported network protocol: {self.protocol!r}")
-        if self.evaluation_rows != self.math_rows + self.instruction_rows:
-            raise ValueError("math_rows plus instruction_rows must equal evaluation_rows")
+        if self.sources_digest != EVALUATION_SOURCES_DIGEST:
+            raise ValueError(
+                "evaluation sources differ from the subnet protocol; "
+                f"expected digest {EVALUATION_SOURCES_DIGEST}"
+            )
         if self.evaluation_rows != EVALUATION_ROWS:
             raise ValueError(f"this protocol requires exactly {EVALUATION_ROWS} rows")
         if self.base_model != BASE_MODEL or self.base_revision != BASE_MODEL_REVISION:
             raise ValueError("base model or revision differs from the subnet protocol")
-        if self.math_dataset != MATH_DATASET or self.math_revision != MATH_DATASET_REVISION:
-            raise ValueError("math dataset or revision differs from the subnet protocol")
-        if (
-            self.instruction_dataset != INSTRUCTION_DATASET
-            or self.instruction_revision != INSTRUCTION_DATASET_REVISION
-        ):
-            raise ValueError("instruction dataset or revision differs from the subnet protocol")
-        if self.split != "train":
-            raise ValueError("this protocol requires the train dataset split")
-        if self.math_rows != MATH_ROWS or self.instruction_rows != INSTRUCTION_ROWS:
-            raise ValueError(f"this protocol requires {MATH_ROWS} math and {INSTRUCTION_ROWS} instruction rows")
         if self.max_lora_rank > MAX_LORA_RANK or self.max_lora_rank <= 0:
             raise ValueError("invalid max_lora_rank")
         if self.max_output_tokens != MAX_OUTPUT_TOKENS:
@@ -166,15 +149,6 @@ class NetworkConfig:
         ):
             if int(getattr(self, name)) <= 0:
                 raise ValueError(f"{name} must be positive")
-        revisions = (self.math_revision, self.instruction_revision)
-        if production and any(
-            len(value) != 40 or any(character not in "0123456789abcdef" for character in value)
-            for value in revisions
-        ):
-            raise ValueError(
-                "production requires immutable 40-character Hugging Face dataset revisions; "
-                "replace both dataset revisions in the network config"
-            )
         if self.champion_count != CHAMPION_COUNT:
             raise ValueError(f"this protocol requires exactly {CHAMPION_COUNT} champions")
         if self.miner_share != MINER_SHARE:
@@ -244,6 +218,7 @@ class NetworkConfig:
             "feval-network-v30",
             "feval-network-v31",
             "feval-network-v32",
+            "feval-network-v33",
         }:
             # Operational compatibility for previously sealed configurations. All
             # code-pinned evaluation and audit-size fields take their current
@@ -273,8 +248,14 @@ class NetworkConfig:
             value["blacklist_enabled"] = BLACKLIST_ENABLED
             value["dataset_window_blocks"] = DATASET_WINDOW_BLOCKS
             value["evaluation_rows"] = EVALUATION_ROWS
-            value["math_rows"] = MATH_ROWS
-            value["instruction_rows"] = INSTRUCTION_ROWS
+            # v34 replaced the two-dataset pins with one code-pinned source table.
+            for retired in (
+                "math_dataset", "math_revision", "math_rows",
+                "instruction_dataset", "instruction_revision", "instruction_rows",
+                "split",
+            ):
+                value.pop(retired, None)
+            value["sources_digest"] = EVALUATION_SOURCES_DIGEST
             value["max_output_tokens"] = MAX_OUTPUT_TOKENS
             value["max_context_tokens"] = MAX_CONTEXT_TOKENS
             value.pop("candidate_pool_root", None)

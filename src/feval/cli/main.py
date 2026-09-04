@@ -11,14 +11,13 @@ from pathlib import Path
 
 from ..chain import publish_commitment, serve_axon, set_weights
 from ..core.config import NetworkConfig, load_network_config
-from ..core.constants import DEFAULT_ROLLOUT_BATCH_SIZE, MAX_OUTPUT_TOKENS, MAX_PROMPT_CHARS
-from ..utils.crypto import write_key
-from ..datasets.dataset import (
-    DEFAULT_SPLIT,
-    INSTRUCTION_DATASET,
-    MATH_DATASET,
-    prepare_combined_eval,
+from ..core.constants import (
+    DEFAULT_ROLLOUT_BATCH_SIZE,
+    MAX_OUTPUT_TOKENS,
+    SUBNET_NETUID,
 )
+from ..utils.crypto import write_key
+from ..datasets.dataset import build_evaluation_window
 from ..utils.jsonutil import write_json
 from ..utils.ops import check_health
 from ..protocol import build_submission, create_demo_files, train_mock_adapter
@@ -78,30 +77,28 @@ def cmd_keygen(args: argparse.Namespace) -> None:
 
 
 def cmd_dataset_prepare(args: argparse.Namespace) -> None:
+    import sys as _sys
+
+    def progress(source: str, scanned: int, selected: int) -> None:
+        print(f"  {source}: scanned={scanned} selected={selected}", file=_sys.stderr, flush=True)
+
     try:
-        manifest = prepare_combined_eval(
+        manifest = build_evaluation_window(
+            window=args.window,
+            netuid=args.netuid,
             out_path=args.out,
             manifest_path=args.manifest,
-            math_input_file=args.math_input_file,
-            instruction_input_file=args.instruction_input_file,
-            math_dataset=args.math_dataset,
-            instruction_dataset=args.instruction_dataset,
-            split=args.split,
-            scan_limit=args.scan_limit,
-            max_rows=args.max_rows,
-            math_rows=args.math_rows,
-            instruction_rows=args.instruction_rows,
-            max_prompt_chars=args.max_prompt_chars,
+            token=_hf_token_from_env() or False,
+            progress=progress if args.verbose else None,
         )
     except Exception as exc:
         fail(str(exc))
-    _print_result("prepared evaluation set", {
-        "base_model": manifest["base_model"],
-        "math_dataset": manifest["datasets"]["math"],
-        "instruction_dataset": manifest["datasets"]["instruction_follow"],
+    _print_result("prepared evaluation window", {
+        "dataset_window": manifest["dataset_window"],
         "rows": manifest["rows"],
-        "math": manifest["tasks"]["math"],
-        "instruction_follow": manifest["tasks"]["instruction_follow"],
+        "guess_resistant_rows": manifest["guess_resistant_rows"],
+        "tasks": ", ".join(f"{k}={v}" for k, v in sorted(manifest["tasks"].items())),
+        "verifiers": ", ".join(f"{k}={v}" for k, v in sorted(manifest["verifiers"].items())),
         "evaluation_root": manifest["evaluation_root"],
         "out": args.out,
         "manifest": args.manifest,
@@ -561,17 +558,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     dataset = sub.add_parser("dataset", help="Prepare cheap-verifiable evaluation sets.", formatter_class=FevalHelpFormatter)
     dataset_sub = dataset.add_subparsers(dest="dataset_command", required=True)
-    prepare = dataset_sub.add_parser("prepare", help="Build a combined NVIDIA math + instruction-following eval set.", formatter_class=FevalHelpFormatter)
-    prepare.add_argument("--math-dataset", default=MATH_DATASET)
-    prepare.add_argument("--instruction-dataset", default=INSTRUCTION_DATASET)
-    prepare.add_argument("--split", default=DEFAULT_SPLIT)
-    prepare.add_argument("--math-input-file", help="Local JSONL/JSON/CSV/parquet export for the math dataset.")
-    prepare.add_argument("--instruction-input-file", help="Local JSONL/JSON/CSV/parquet export for the instruction-following dataset.")
-    prepare.add_argument("--scan-limit", type=int, help="Maximum raw rows to scan before filtering.")
-    prepare.add_argument("--max-rows", type=int, default=10_000)
-    prepare.add_argument("--math-rows", type=int, help="Math row budget. Defaults to half of --max-rows.")
-    prepare.add_argument("--instruction-rows", type=int, help="Instruction-following row budget. Defaults to remaining rows.")
-    prepare.add_argument("--max-prompt-chars", type=int, default=MAX_PROMPT_CHARS)
+    prepare = dataset_sub.add_parser(
+        "prepare",
+        help="Build one deterministic evaluation window from the pinned sources.",
+        formatter_class=FevalHelpFormatter,
+    )
+    prepare.add_argument("--window", type=int, required=True, help="Dataset window number (finalized block // 14400).")
+    prepare.add_argument("--netuid", type=int, default=SUBNET_NETUID)
+    prepare.add_argument("--verbose", action="store_true", help="Report per-source scan progress.")
     prepare.add_argument("--out", required=True)
     prepare.add_argument("--manifest", required=True)
     prepare.set_defaults(func=cmd_dataset_prepare)

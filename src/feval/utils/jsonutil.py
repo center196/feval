@@ -36,12 +36,22 @@ def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
     return rows
 
 
-def write_jsonl(path: str | Path, rows: list[dict[str, Any]]) -> None:
+def write_jsonl(path: str | Path, rows: list[dict[str, Any]], *, ascii_only: bool = False) -> None:
+    """Write one JSON object per line.
+
+    ``ascii_only`` escapes every non-ASCII character. Source prompts can carry
+    U+2028/U+2029, which are legal inside a JSON string but which Python's
+    ``str.splitlines`` and several other readers treat as line breaks. Escaping
+    them keeps the artifact parseable by a naive line splitter. The Merkle root
+    is taken over row values rather than file bytes, so this never changes
+    consensus.
+    """
+
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     with target.open("w", encoding="utf-8") as f:
         for row in rows:
-            f.write(json.dumps(row, sort_keys=True, ensure_ascii=False))
+            f.write(json.dumps(row, sort_keys=True, ensure_ascii=ascii_only))
             f.write("\n")
 
 
