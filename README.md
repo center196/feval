@@ -106,6 +106,11 @@ W&B account by setting `WANDB_API_KEY`, and Feval automatically publishes its
 public result summary to this fixed destination. Reporting failures are visible
 in validator status but never change evaluation or emitted weights.
 
+The published leaderboard table includes each miner's `model_repo`,
+`rollout_repo`, and `invalid_reason`. The invalid reason is empty while a miner
+is still auditing or an operational retry is in progress. It contains only a
+sanitized audit-gate outcome; internal system errors are not published.
+
 Set `FEVAL_REPORT_WANDB=0` in `.env` to disable automatic reporting. The public
 destination is `WANDB_ENTITY=feval196-feval` and `WANDB_PROJECT=feval-valid`;
 validator results always use that shared destination.

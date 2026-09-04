@@ -11,7 +11,8 @@ from ..utils.jsonutil import load_json, write_json, write_jsonl
 from ..protocol.merkle import root_for_values
 
 
-PROTOCOL_RESULTS_MANIFEST = "feval-results-v1"
+PROTOCOL_RESULTS_MANIFEST = "feval-results-v2"
+SUPPORTED_RESULTS_MANIFESTS = {"feval-results-v1", PROTOCOL_RESULTS_MANIFEST}
 
 
 def _load_jsonl_exact(path: str | Path) -> list[dict[str, Any]]:
@@ -33,6 +34,22 @@ def _status(valid: bool, final_weight: float) -> str:
     if final_weight > 0.0:
         return "rewarded"
     return "valid"
+
+
+def _public_invalid_reason(result: dict[str, Any], status: str) -> str | None:
+    """Return a stable audit-gate reason without exposing internal exceptions."""
+
+    if "invalid_reason" in result:
+        reason = result.get("invalid_reason")
+        return reason if isinstance(reason, str) and reason else None
+    copy_kind = result.get("copy_kind")
+    copy_source = result.get("copy_source")
+    if copy_kind in {"model", "rollout"}:
+        suffix = f" of {copy_source}" if isinstance(copy_source, str) and copy_source else ""
+        return f"{copy_kind} copy{suffix}"
+    if status in {"invalid", "blacklisted"}:
+        return "invalid rollout"
+    return None
 
 
 def result_rows_from_state(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -71,6 +88,7 @@ def result_rows_from_state(state: dict[str, Any]) -> list[dict[str, Any]]:
                 )
             )
         )
+        invalid_reason = _public_invalid_reason(result, status)
         row = {
             "hotkey": str(hotkey),
             "uid": uid,
@@ -82,8 +100,10 @@ def result_rows_from_state(state: dict[str, Any]) -> list[dict[str, Any]]:
             "correct": result.get("correct"),
             "rows": result.get("rows"),
             "model_digest": result.get("model_digest"),
+            "model_repo": result.get("model_repo"),
             "model_revision": result.get("model_revision"),
             "commit_block": result.get("commit_block"),
+            "rollout_repo": result.get("rollout_repo"),
             "rollout_revision": result.get("rollout_revision"),
             "audit_block": result.get("audit_block"),
             "audited_count": len(result.get("audited_rows", [])),
@@ -93,7 +113,7 @@ def result_rows_from_state(state: dict[str, Any]) -> list[dict[str, Any]]:
             "audit_exact_match_ratio": result.get("audit_cumulative_exact_match_ratio"),
             "blacklisted_until_block": result.get("blacklisted_until_block"),
             "source_window": result.get("source_window"),
-            "error": result.get("error"),
+            "invalid_reason": invalid_reason,
         }
         rows.append(row)
     return rows
@@ -118,12 +138,14 @@ def leaderboard_from_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "score": float(row.get("score") or 0.0),
             "final_weight": float(row.get("final_weight") or 0.0),
             "model_digest": row.get("model_digest"),
+            "model_repo": row.get("model_repo"),
+            "rollout_repo": row.get("rollout_repo"),
             "audit_status": row.get("audit_status"),
             "audit_round": row.get("audit_round"),
             "audit_required_rounds": row.get("audit_required_rounds"),
             "audit_total_rounds": row.get("audit_total_rounds"),
             "audited_count": row.get("audited_count"),
-            "error": row.get("error"),
+            "invalid_reason": row.get("invalid_reason"),
         }
         for index, row in enumerate(ordered, start=1)
     ]
@@ -165,7 +187,7 @@ def export_results_bundle(
 def verify_results_bundle(bundle_dir: str | Path) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
     root = Path(bundle_dir)
     manifest = load_json(root / "manifest.json")
-    if not isinstance(manifest, dict) or manifest.get("protocol") != PROTOCOL_RESULTS_MANIFEST:
+    if not isinstance(manifest, dict) or manifest.get("protocol") not in SUPPORTED_RESULTS_MANIFESTS:
         raise ValueError("results manifest has an unsupported protocol")
     results_file = manifest.get("summary_file")
     leaderboard_file = manifest.get("leaderboard_file")
@@ -265,7 +287,9 @@ def log_results_to_wandb(
             "valid",
             "score",
             "final_weight",
-            "error",
+            "model_repo",
+            "rollout_repo",
+            "invalid_reason",
         ],
         data=[
             [
@@ -281,7 +305,9 @@ def log_results_to_wandb(
                 row.get("valid"),
                 row.get("score"),
                 row.get("final_weight"),
-                row.get("error"),
+                row.get("model_repo"),
+                row.get("rollout_repo"),
+                row.get("invalid_reason"),
             ]
             for row in board
         ],

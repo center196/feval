@@ -752,6 +752,26 @@ def _manifest_matches(
             raise ValueError(f"rollout manifest {name} does not match chain/evaluation state")
 
 
+def _commitment_result_fields(
+    commitment: ModelCommitment | dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Return public repository metadata from a parsed or compact commitment."""
+
+    if isinstance(commitment, ModelCommitment):
+        return {
+            "model_repo": commitment.model_repo,
+            "model_revision": commitment.model_revision,
+            "rollout_repo": commitment.rollout_repo,
+        }
+    if isinstance(commitment, dict):
+        return {
+            "model_repo": commitment.get("m"),
+            "model_revision": commitment.get("r"),
+            "rollout_repo": commitment.get("d"),
+        }
+    return {"model_repo": None, "model_revision": None, "rollout_repo": None}
+
+
 def score_rollouts(
     eval_rows: list[dict[str, Any]],
     rollout_rows: list[dict[str, Any]],
@@ -1013,6 +1033,11 @@ class ValidatorRunner:
                     "valid": True,
                     "score": float(source["score"]),
                     "model_digest": str(source["model_digest"]),
+                    "model_repo": source.get("model_repo"),
+                    "model_revision": source.get("model_revision"),
+                    "rollout_repo": source.get("rollout_repo"),
+                    "rollout_revision": source.get("rollout_revision"),
+                    "commit_block": source.get("commit_block"),
                     "uid": source.get("uid"),
                     "carryover": True,
                     "source_window": (
@@ -1117,13 +1142,17 @@ class ValidatorRunner:
                     if displaced is not None and displaced != hotkey:
                         self.state["pending"].pop(displaced, None)
                         previous_copy = self.state["results"].get(displaced, {})
+                        displaced_commitment = commitments.get(displaced, {}).get("commitment")
                         self.state["results"][displaced] = {
                             "uid": previous_copy.get("uid") if isinstance(previous_copy, dict) else None,
                             "valid": False,
                             "score": 0.0,
+                            "model_digest": getattr(displaced_commitment, "model_digest", None),
+                            **_commitment_result_fields(displaced_commitment),
                             "audit_status": "copied",
                             "copy_kind": "rollout",
                             "copy_source": hotkey,
+                            "invalid_reason": f"rollout copy of {hotkey}",
                             "rollout_rows_sha256": manifest.rows_sha256,
                             "error": f"identical greedy rollouts were committed first by {hotkey}",
                         }
@@ -1293,7 +1322,7 @@ class ValidatorRunner:
                     "rows": len(scored),
                     "reward_bits": encode_reward_bits([int(row["reward"]) for row in scored]),
                     "model_digest": commitment.model_digest,
-                    "model_revision": commitment.model_revision,
+                    **_commitment_result_fields(commitment),
                     "commit_block": current["commit_block"],
                     "rollout_revision": rollout_revision,
                     "audited_rows": list(audited_rows),
@@ -1312,6 +1341,7 @@ class ValidatorRunner:
                     "blacklisted_until_block": (
                         int(blacklisted["until_block"]) if blacklisted is not None else None
                     ),
+                    "invalid_reason": None if audit_valid else "invalid rollout",
                     "error": None
                     if audit_valid
                     else (
@@ -1352,7 +1382,8 @@ class ValidatorRunner:
             except ValueError as exc:
                 timings["total"] = round(time.monotonic() - audit_started, 3)
                 blacklisted = None
-                if _counts_as_invalid_strike(exc):
+                counts_as_invalid = _counts_as_invalid_strike(exc)
+                if counts_as_invalid:
                     blacklisted = _record_invalid_round(
                         self.state,
                         hotkey=hotkey,
@@ -1367,6 +1398,7 @@ class ValidatorRunner:
                     "valid": False,
                     "score": 0.0,
                     "model_digest": pending["commitment"].get("h"),
+                    **_commitment_result_fields(pending.get("commitment")),
                     "rollout_revision": pending.get("rollout_revision"),
                     "audit_status": (
                         "blacklisted"
@@ -1376,6 +1408,11 @@ class ValidatorRunner:
                     "copy_kind": "rollout" if isinstance(exc, DuplicateRolloutError) else None,
                     "copy_source": (
                         exc.earlier_hotkey if isinstance(exc, DuplicateRolloutError) else None
+                    ),
+                    "invalid_reason": (
+                        f"rollout copy of {exc.earlier_hotkey}"
+                        if isinstance(exc, DuplicateRolloutError)
+                        else ("invalid rollout" if counts_as_invalid else None)
                     ),
                     "rollout_rows_sha256": (
                         exc.rows_sha256 if isinstance(exc, DuplicateRolloutError) else None
@@ -1440,9 +1477,11 @@ class ValidatorRunner:
                         else 0.0
                     ),
                     "model_digest": pending["commitment"].get("h"),
+                    **_commitment_result_fields(pending.get("commitment")),
                     "rollout_revision": pending.get("rollout_revision"),
                     "audit_status": "retrying",
                     "audit_timings_seconds": timings,
+                    "invalid_reason": None,
                     "error": f"recoverable {type(exc).__name__}: {exc}",
                 }
                 round_results.append(
@@ -1491,7 +1530,9 @@ class ValidatorRunner:
                     "valid": False,
                     "score": 0.0,
                     "model_digest": commitment.model_digest,
+                    **_commitment_result_fields(commitment),
                     "audit_status": "retrying",
+                    "invalid_reason": None,
                     "error": f"recoverable rollout pin failure: {type(exc).__name__}: {exc}",
                 }
                 continue
@@ -1681,6 +1722,22 @@ class ValidatorRunner:
         _validator_progress("current_commitments_ready", miners=len(rows))
         eligible, copies = _copy_filtered(rows)
         current = {row["hotkey"]: row for row in rows}
+        # Backfill repository metadata into states written by older validators.
+        # Only enrich an entry when its digest still matches the on-chain
+        # commitment, so a newly committed repository is never attached to an
+        # older result.
+        for result_group_name in ("results", "carryover_results"):
+            result_group = self.state.get(result_group_name, {})
+            if not isinstance(result_group, dict):
+                continue
+            for hotkey, result in result_group.items():
+                current_commitment = current.get(hotkey, {}).get("commitment")
+                if (
+                    isinstance(result, dict)
+                    and isinstance(current_commitment, ModelCommitment)
+                    and result.get("model_digest") == current_commitment.model_digest
+                ):
+                    result.update(_commitment_result_fields(current_commitment))
         self.state["rollout_priority"] = {
             key: entry
             for key, entry in self.state.get("rollout_priority", {}).items()
@@ -1709,13 +1766,17 @@ class ValidatorRunner:
                 self.state["results"].pop(hotkey, None)
                 self.state["pending"].pop(hotkey, None)
         for hotkey, first_miner in copies.items():
+            current_commitment = current.get(hotkey, {}).get("commitment")
             self.state["results"][hotkey] = {
                 "uid": current.get(hotkey, {}).get("uid"),
                 "valid": False,
                 "score": 0.0,
+                "model_digest": getattr(current_commitment, "model_digest", None),
+                **_commitment_result_fields(current_commitment),
                 "audit_status": "copied",
                 "copy_kind": "model",
                 "copy_source": first_miner,
+                "invalid_reason": f"model copy of {first_miner}",
                 "error": f"model digest was committed first by {first_miner}",
             }
         active_blacklist = _active_blacklist(
@@ -1725,11 +1786,15 @@ class ValidatorRunner:
             eligible = [row for row in eligible if row["hotkey"] not in active_blacklist]
             for blacklisted_hotkey, entry in active_blacklist.items():
                 self.state["pending"].pop(blacklisted_hotkey, None)
+                current_commitment = current.get(blacklisted_hotkey, {}).get("commitment")
                 self.state["results"][blacklisted_hotkey] = {
                     "uid": current.get(blacklisted_hotkey, {}).get("uid"),
                     "valid": False,
                     "score": 0.0,
+                    "model_digest": getattr(current_commitment, "model_digest", None),
+                    **_commitment_result_fields(current_commitment),
                     "audit_status": "blacklisted",
+                    "invalid_reason": "invalid rollout",
                     "blacklisted_until_block": int(entry["until_block"]),
                     "error": (
                         "hotkey is blacklisted after three deterministic invalid audit rounds "

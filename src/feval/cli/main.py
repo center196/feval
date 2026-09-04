@@ -308,7 +308,7 @@ def cmd_miner_status(args: argparse.Namespace) -> None:
             "audit_total_rounds": result.get("audit_total_rounds"),
             "audit_exact_match_ratio": result.get("audit_exact_match_ratio"),
             "audit_block": result.get("audit_block"),
-            "error": result.get("error"),
+            "invalid_reason": result.get("invalid_reason"),
         },
     )
 
