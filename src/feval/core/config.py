@@ -243,6 +243,7 @@ class NetworkConfig:
             "feval-network-v29",
             "feval-network-v30",
             "feval-network-v31",
+            "feval-network-v32",
         }:
             # Operational compatibility for previously sealed configurations. All
             # code-pinned evaluation and audit-size fields take their current

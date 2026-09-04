@@ -33,6 +33,11 @@ Set `HF_TOKEN` on miner hosts that upload to Hugging Face. Validators do not
 need a Hugging Face token when model and rollout repositories are public.
 Never commit `.env`, wallet files, private keys, tokens, or validator state.
 
+Each two-day window selects its 10,000 rows from all valid rows in both pinned
+public Hugging Face datasets. The first cycle for a window reports source-scan
+progress while preparing the local evaluation cache; the unauthenticated-request
+warning is harmless for public repositories.
+
 ## Repository layout
 
 ```text
@@ -190,20 +195,14 @@ licenses and attribution obligations.
 Feval has two operating roles only:
 
 - Miners commit models on chain and publish immutable model and rollout data.
-- Validators independently read finalized chain state, derive the evaluation
-  pool from pinned public dataset revisions, audit miners, and submit weights.
+- Validators independently read finalized chain state, derive each evaluation
+  set from all valid rows in the pinned public dataset revisions, audit miners,
+  and submit weights.
 
 There is no third operational service, privileged protocol key, miner allowlist,
 or centrally supplied launch configuration. The finalized chain, immutable source
-revisions, and versioned protocol code are the shared inputs. Validators can
-compare their independently derived candidate-pool roots with:
-
-```bash
-feval dataset candidate-pool \
-  --config network.json \
-  --out validator-work/candidate-pool.jsonl \
-  --manifest validator-work/candidate-pool.manifest.json
-```
+revisions, and versioned protocol code are the shared inputs. Every evaluation
+manifest includes a deterministic root that validators can compare directly.
 
 Reporting services such as Weights & Biases are optional mirrors and never
 affect scoring or consensus. Protocol upgrades take effect only when miners and

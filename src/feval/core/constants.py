@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 
-PROTOCOL_NETWORK = "feval-network-v32"
+PROTOCOL_NETWORK = "feval-network-v33"
 PROTOCOL_MODEL_COMMITMENT = "f3"
 PROTOCOL_MODEL_MANIFEST = "feval-model-v4"
 PROTOCOL_ROLLOUT_MANIFEST = "feval-rollouts-v17"
-PROTOCOL_VALIDATOR_STATE = "feval-validator-state-v30"
-PROTOCOL_MINER_ROLLOUT_STATE = "feval-miner-rollout-state-v14"
+PROTOCOL_VALIDATOR_STATE = "feval-validator-state-v31"
+PROTOCOL_MINER_ROLLOUT_STATE = "feval-miner-rollout-state-v15"
 
 SUBNET_NETUID = 47
 PUBLIC_WANDB_ENTITY = "feval196-feval"
@@ -44,7 +44,6 @@ INSTRUCTION_DATASET_REVISION = "3b253899665cb71334bb54c14eb5d91751beaad7"
 EVALUATION_ROWS = 10_000
 MATH_ROWS = 5_000
 INSTRUCTION_ROWS = 5_000
-CANDIDATE_POOL_ROWS_PER_TASK = 50_000
 # Keep each deterministic 10,000-row evaluation set active for approximately
 # two days at Bittensor's target of one finalized block every 12 seconds.
 DATASET_WINDOW_BLOCKS = 2 * 24 * 60 * 5

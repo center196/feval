@@ -18,7 +18,6 @@ from ..datasets.dataset import (
     INSTRUCTION_DATASET,
     MATH_DATASET,
     prepare_combined_eval,
-    prepare_candidate_pool_from_config,
 )
 from ..utils.jsonutil import write_json
 from ..utils.ops import check_health
@@ -107,30 +106,6 @@ def cmd_dataset_prepare(args: argparse.Namespace) -> None:
         "out": args.out,
         "manifest": args.manifest,
     })
-
-
-def cmd_dataset_candidate_pool(args: argparse.Namespace) -> None:
-    try:
-        config = load_network_config(args.config, production=False)
-        manifest = prepare_candidate_pool_from_config(
-            config,
-            out_path=args.out,
-            manifest_path=args.manifest,
-            math_input_file=args.math_input_file,
-            instruction_input_file=args.instruction_input_file,
-            scan_limit=args.scan_limit,
-        )
-        result = {
-            "candidate_pool_root": manifest["evaluation_root"],
-            "rows": manifest["rows"],
-            "math": manifest["tasks"]["math"],
-            "instruction_follow": manifest["tasks"]["instruction_follow"],
-            "out": args.out,
-            "manifest": args.manifest,
-        }
-        _print_result("prepared candidate pool", result)
-    except Exception as exc:
-        fail(str(exc))
 
 
 def cmd_miner_train(args: argparse.Namespace) -> None:
@@ -600,19 +575,6 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--out", required=True)
     prepare.add_argument("--manifest", required=True)
     prepare.set_defaults(func=cmd_dataset_prepare)
-    candidate_pool = dataset_sub.add_parser(
-        "candidate-pool",
-        help="Independently derive the deterministic candidate pool and print its root.",
-        formatter_class=FevalHelpFormatter,
-    )
-    candidate_pool.add_argument("--config", default="network.json")
-    candidate_pool.add_argument("--math-input-file", help="Local JSONL/JSON/CSV/parquet export for the math dataset.")
-    candidate_pool.add_argument("--instruction-input-file", help="Local JSONL/JSON/CSV/parquet export for the instruction-following dataset.")
-    candidate_pool.add_argument("--scan-limit", type=int, help="Maximum raw rows to scan before filtering.")
-    candidate_pool.add_argument("--out", required=True)
-    candidate_pool.add_argument("--manifest", required=True)
-    candidate_pool.set_defaults(func=cmd_dataset_candidate_pool)
-
     miner = sub.add_parser("miner", help="Miner commands.", formatter_class=FevalHelpFormatter)
     miner_sub = miner.add_subparsers(dest="miner_command", required=True)
     status = miner_sub.add_parser(

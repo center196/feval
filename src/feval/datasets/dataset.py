@@ -6,12 +6,11 @@ import heapq
 import json
 import re
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 from ..core.config import NetworkConfig
 from ..core.constants import (
     BASE_MODEL,
-    CANDIDATE_POOL_ROWS_PER_TASK,
     INSTRUCTION_DATASET,
     MATH_DATASET,
     MAX_PROMPT_CHARS,
@@ -25,6 +24,7 @@ from ..protocol.schedule import evaluation_seed
 
 
 DEFAULT_SPLIT = "train"
+PROTOCOL_EVALUATION_MANIFEST = "feval-dataset-manifest-v3"
 
 SUPPORTED_INSTRUCTION_IDS = {
     "change_case:english_capital",
@@ -364,19 +364,6 @@ def _load_source(
     return _load_local(input_file) if input_file else _load_huggingface(dataset_name, split, scan_limit, revision)
 
 
-def _stable_take(rows: list[dict[str, Any]], count: int, seed: str, domain: str) -> list[dict[str, Any]]:
-    unique: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        unique.setdefault(str(row["row_id"]), row)
-    ranked = sorted(
-        unique.values(),
-        key=lambda row: hashlib.sha256(
-            f"feval/window/v2\0{seed}\0{domain}\0{row['row_id']}".encode("utf-8")
-        ).digest(),
-    )
-    return ranked[:count]
-
-
 def _select_streaming(
     rows: Iterable[dict[str, Any]],
     *,
@@ -385,13 +372,20 @@ def _select_streaming(
     seed: str,
     domain: str,
     max_prompt_chars: int,
+    progress: Callable[[str, int, int], None] | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """Keep the smallest seeded hashes without retaining the source dataset."""
 
     heap: list[tuple[int, str, dict[str, Any]]] = []
     rejected = 0
     selected_ids: set[str] = set()
+    scanned = 0
+    if progress is not None:
+        progress(domain, scanned, 0)
     for index, source in enumerate(rows):
+        scanned = index + 1
+        if progress is not None and scanned % 10_000 == 0:
+            progress(domain, scanned, len(heap))
         row = normalize(source, index, max_prompt_chars)
         if row is None:
             rejected += 1
@@ -411,6 +405,8 @@ def _select_streaming(
             removed = heapq.heapreplace(heap, entry)
             selected_ids.discard(removed[1])
             selected_ids.add(row_id)
+    if progress is not None and scanned % 10_000 != 0:
+        progress(domain, scanned, len(heap))
     return [entry[2] for entry in sorted(heap, key=lambda item: (-item[0], item[1]))], rejected
 
 
@@ -441,6 +437,7 @@ def prepare_combined_eval(
     seed: str | None = None,
     window: int | None = None,
     netuid: int = SUBNET_NETUID,
+    progress: Callable[[str, int, int], None] | None = None,
 ) -> dict[str, Any]:
     math_budget = math_rows if math_rows is not None else max_rows // 2
     instruction_budget = instruction_rows if instruction_rows is not None else max_rows - math_budget
@@ -461,6 +458,7 @@ def prepare_combined_eval(
         seed=selection_seed,
         domain="math",
         max_prompt_chars=max_prompt_chars,
+        progress=progress,
     )
     instruction_kept, instruction_rejected = _select_streaming(
         raw_instruction,
@@ -469,6 +467,7 @@ def prepare_combined_eval(
         seed=selection_seed,
         domain="instruction_follow",
         max_prompt_chars=max_prompt_chars,
+        progress=progress,
     )
     for row in math_kept:
         row["source_dataset"] = math_dataset
@@ -532,13 +531,14 @@ def prepare_window_from_config(
     math_input_file: str | Path | None = None,
     instruction_input_file: str | Path | None = None,
     scan_limit: int | None = None,
+    progress: Callable[[str, int, int], None] | None = None,
 ) -> dict[str, Any]:
     # Every miner and validator derives the same window from immutable dataset
     # snapshots and code-pinned protocol rules.
     config.validate()
     for revision in (config.math_revision, config.instruction_revision):
         if len(revision) != 40 or any(character not in "0123456789abcdef" for character in revision):
-            raise ValueError("candidate pool requires immutable dataset revisions")
+            raise ValueError("evaluation windows require immutable dataset revisions")
     manifest = prepare_combined_eval(
         out_path=out_path,
         manifest_path=manifest_path,
@@ -557,124 +557,17 @@ def prepare_window_from_config(
         seed=evaluation_seed(config.netuid, window),
         window=window,
         netuid=config.netuid,
+        progress=progress,
     )
+    manifest["protocol"] = PROTOCOL_EVALUATION_MANIFEST
+    manifest["kind"] = "evaluation_window"
+    manifest["candidate_source"] = "all_valid_rows"
+    write_json(manifest_path, manifest)
     if manifest["rows"] != config.evaluation_rows:
         raise ValueError(
             f"dataset window contains {manifest['rows']} valid rows; "
             f"the protocol requires {config.evaluation_rows}"
         )
-    return manifest
-
-
-def prepare_candidate_pool_from_config(
-    config: NetworkConfig,
-    *,
-    out_path: str | Path,
-    manifest_path: str | Path,
-    math_input_file: str | Path | None = None,
-    instruction_input_file: str | Path | None = None,
-    scan_limit: int | None = None,
-) -> dict[str, Any]:
-    """Build the version-pinned, security-filtered pool once per validator."""
-
-    # Every participant independently derives this pool from immutable source
-    # snapshots. The resulting root is useful for cross-validator comparison.
-    config.validate(production=False)
-    pool_seed = hashlib.sha256(
-        (
-            "feval/candidate-pool/v2\0"
-            + config.math_revision
-            + "\0"
-            + config.instruction_revision
-        ).encode("ascii")
-    ).hexdigest()
-    manifest = prepare_combined_eval(
-        out_path=out_path,
-        manifest_path=manifest_path,
-        math_input_file=math_input_file,
-        instruction_input_file=instruction_input_file,
-        math_dataset=config.math_dataset,
-        instruction_dataset=config.instruction_dataset,
-        math_revision=config.math_revision,
-        instruction_revision=config.instruction_revision,
-        split=config.split,
-        scan_limit=scan_limit,
-        max_rows=CANDIDATE_POOL_ROWS_PER_TASK * 2,
-        math_rows=CANDIDATE_POOL_ROWS_PER_TASK,
-        instruction_rows=CANDIDATE_POOL_ROWS_PER_TASK,
-        max_prompt_chars=config.max_prompt_chars,
-        seed=pool_seed,
-        window=None,
-        netuid=config.netuid,
-    )
-    manifest["kind"] = "candidate_pool"
-    manifest["candidate_pool_rows_per_task"] = CANDIDATE_POOL_ROWS_PER_TASK
-    write_json(manifest_path, manifest)
-    for task in ("math", "instruction_follow"):
-        if manifest["tasks"][task] < getattr(config, f"{task.replace('_follow', '')}_rows"):
-            raise ValueError(f"safe candidate pool has too few {task} rows")
-    return manifest
-
-
-def prepare_window_from_pool(
-    config: NetworkConfig,
-    *,
-    window: int,
-    pool_path: str | Path,
-    pool_manifest_path: str | Path,
-    out_path: str | Path,
-    manifest_path: str | Path,
-) -> dict[str, Any]:
-    pool_rows = list(_load_local(pool_path))
-    pool_manifest = json.loads(Path(pool_manifest_path).read_text(encoding="utf-8"))
-    if pool_manifest.get("kind") != "candidate_pool":
-        raise ValueError("candidate pool manifest has the wrong kind")
-    if pool_manifest.get("evaluation_root") != root_for_values(pool_rows):
-        raise ValueError("candidate pool root does not match its rows")
-    expected_revisions = {
-        "math": config.math_revision,
-        "instruction_follow": config.instruction_revision,
-    }
-    if pool_manifest.get("dataset_revisions") != expected_revisions:
-        raise ValueError("candidate pool dataset revisions do not match network config")
-    seed = evaluation_seed(config.netuid, window)
-    math = [row for row in pool_rows if row.get("task_type") == "math"]
-    instruction = [row for row in pool_rows if row.get("task_type") == "instruction_follow"]
-    _require_unique_row_ids(math, "math candidate pool")
-    _require_unique_row_ids(instruction, "instruction candidate pool")
-    kept = _stable_take(math, config.math_rows, seed, "math")
-    kept += _stable_take(instruction, config.instruction_rows, seed, "instruction_follow")
-    kept = sorted(
-        kept,
-        key=lambda row: hashlib.sha256(
-            f"feval/order/v2\0{seed}\0{row['row_id']}".encode("utf-8")
-        ).digest(),
-    )
-    if len(kept) != config.evaluation_rows:
-        raise ValueError("candidate pool cannot supply the required evaluation rows")
-    _require_unique_row_ids(kept, "evaluation set")
-    write_jsonl(out_path, kept)
-    manifest = {
-        "protocol": "feval-dataset-manifest-v2",
-        "kind": "evaluation_window",
-        "base_model": config.base_model,
-        "base_revision": config.base_revision,
-        "datasets": {
-            "math": config.math_dataset,
-            "instruction_follow": config.instruction_dataset,
-        },
-        "dataset_revisions": expected_revisions,
-        "split": config.split,
-        "netuid": config.netuid,
-        "dataset_window": window,
-        "evaluation_seed": seed,
-        "rows": len(kept),
-        "tasks": {"math": config.math_rows, "instruction_follow": config.instruction_rows},
-        "candidate_pool_root": pool_manifest["evaluation_root"],
-        "filter_hash": pool_manifest["filter_hash"],
-        "evaluation_root": root_for_values(kept),
-    }
-    write_json(manifest_path, manifest)
     return manifest
 
 

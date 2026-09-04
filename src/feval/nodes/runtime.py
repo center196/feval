@@ -27,7 +27,7 @@ from ..chain import (
 from ..chain.champions import encode_reward_bits, update_champions, winner_weight_mapping
 from ..core.config import NetworkConfig, load_network_config
 from ..core.constants import PROTOCOL_MINER_ROLLOUT_STATE, PROTOCOL_VALIDATOR_STATE
-from ..datasets.dataset import prepare_candidate_pool_from_config, prepare_window_from_pool
+from ..datasets.dataset import PROTOCOL_EVALUATION_MANIFEST, prepare_window_from_config
 from ..models.hub import (
     resolve_rollout_revision,
     safe_download_model,
@@ -185,6 +185,7 @@ def _normalize_state(state: Any) -> dict[str, Any]:
         "feval-validator-state-v27",
         "feval-validator-state-v28",
         "feval-validator-state-v29",
+        "feval-validator-state-v30",
     }:
         # Audit semantics changed. Never carry old pass/fail decisions or
         # partial rounds into a different token-validity protocol.
@@ -348,42 +349,39 @@ def ensure_evaluation_files(
     if eval_path.exists() and manifest_path.exists():
         manifest = load_json(manifest_path)
         if (
-            manifest.get("dataset_window") == window
+            manifest.get("protocol") == PROTOCOL_EVALUATION_MANIFEST
+            and manifest.get("kind") == "evaluation_window"
+            and manifest.get("candidate_source") == "all_valid_rows"
+            and manifest.get("dataset_window") == window
             and manifest.get("evaluation_seed") == evaluation_seed(config.netuid, window)
             and manifest.get("evaluation_root") == root_for_values(load_jsonl(eval_path))
             and manifest.get("rows") == config.evaluation_rows
         ):
             return eval_path, manifest_path, manifest
-    pool_path = root / "candidate-pool.jsonl"
-    pool_manifest_path = root / "candidate-pool.manifest.json"
-    pool_valid = False
-    if pool_path.exists() and pool_manifest_path.exists():
-        try:
-            pool_manifest = load_json(pool_manifest_path)
-            pool_valid = (
-                pool_manifest.get("kind") == "candidate_pool"
-                and pool_manifest.get("dataset_revisions")
-                == {
-                    "math": config.math_revision,
-                    "instruction_follow": config.instruction_revision,
-                }
-                and pool_manifest.get("evaluation_root") == root_for_values(load_jsonl(pool_path))
-            )
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            pool_valid = False
-    if not pool_valid:
-        prepare_candidate_pool_from_config(
-            config,
-            out_path=pool_path,
-            manifest_path=pool_manifest_path,
-        )
-    manifest = prepare_window_from_pool(
+    _validator_progress(
+        "building_evaluation_from_all_rows",
+        authentication="public",
+        target_rows=config.evaluation_rows,
+    )
+    manifest = prepare_window_from_config(
         config,
         window=window,
-        pool_path=pool_path,
-        pool_manifest_path=pool_manifest_path,
         out_path=eval_path,
         manifest_path=manifest_path,
+        progress=lambda task, scanned, selected: _validator_progress(
+            "evaluation_source_progress",
+            task=task,
+            scanned=scanned,
+            selected=selected,
+            target_selected=(
+                config.math_rows if task == "math" else config.instruction_rows
+            ),
+        ),
+    )
+    _validator_progress(
+        "evaluation_ready",
+        rows=manifest.get("rows"),
+        path=str(eval_path),
     )
     return eval_path, manifest_path, manifest
 
@@ -513,6 +511,7 @@ def _load_miner_rollout_state(work_dir: str | Path) -> dict[str, Any]:
         "feval-miner-rollout-state-v11",
         "feval-miner-rollout-state-v12",
         "feval-miner-rollout-state-v13",
+        "feval-miner-rollout-state-v14",
     }:
         return {"protocol": PROTOCOL_MINER_ROLLOUT_STATE, "last_success": None}
     if not isinstance(state, dict) or state.get("protocol") != PROTOCOL_MINER_ROLLOUT_STATE:
