@@ -12,6 +12,7 @@ from .constants import (
     AUDIT_MIN_FAKE_ROW_FRACTION,
     AUDIT_MIN_RELATIVE_PROBABILITY,
     AUDIT_ROWS_PER_ROUND,
+    AUDIT_REQUIRED_ROUNDS,
     AUDIT_TOTAL_ROUNDS,
     BASE_MODEL,
     BASE_MODEL_REVISION,
@@ -45,13 +46,14 @@ class NetworkConfig:
     base_model: str = BASE_MODEL
     base_revision: str = BASE_MODEL_REVISION
     # The evaluation sources are code-pinned as a table; this digest covers
-    # every repo, revision, file, column, verifier and quota in it.
+    # every repo, revision, file, column, verifier and source size in it.
     sources_digest: str = EVALUATION_SOURCES_DIGEST
     evaluation_rows: int = EVALUATION_ROWS
     dataset_window_blocks: int = DATASET_WINDOW_BLOCKS
     weight_interval_blocks: int = WEIGHT_INTERVAL_BLOCKS
     audit_delay_blocks: int = AUDIT_DELAY_BLOCKS
     audit_rows_per_round: int = AUDIT_ROWS_PER_ROUND
+    audit_required_rounds: int = AUDIT_REQUIRED_ROUNDS
     audit_min_fake_row_fraction: float = AUDIT_MIN_FAKE_ROW_FRACTION
     audit_detection_confidence: float = AUDIT_DETECTION_CONFIDENCE
     audit_total_rounds: int = AUDIT_TOTAL_ROUNDS
@@ -103,6 +105,10 @@ class NetworkConfig:
             raise ValueError(f"this protocol requires audit_delay_blocks={AUDIT_DELAY_BLOCKS}")
         if self.audit_rows_per_round != AUDIT_ROWS_PER_ROUND:
             raise ValueError(f"this protocol requires audit_rows_per_round={AUDIT_ROWS_PER_ROUND}")
+        if self.audit_required_rounds != AUDIT_REQUIRED_ROUNDS:
+            raise ValueError(
+                f"this protocol requires audit_required_rounds={AUDIT_REQUIRED_ROUNDS}"
+            )
         if self.audit_min_fake_row_fraction != AUDIT_MIN_FAKE_ROW_FRACTION:
             raise ValueError(
                 "this protocol requires "
@@ -142,6 +148,7 @@ class NetworkConfig:
             "weight_interval_blocks",
             "audit_delay_blocks",
             "audit_rows_per_round",
+            "audit_required_rounds",
             "audit_total_rounds",
             "audit_max_token_rank",
             "max_output_tokens",
@@ -222,6 +229,10 @@ class NetworkConfig:
             "feval-network-v34",
             "feval-network-v35",
             "feval-network-v36",
+            "feval-network-v37",
+            "feval-network-v38",
+            "feval-network-v39",
+            "feval-network-v40",
         }:
             # Operational compatibility for previously sealed configurations. All
             # code-pinned evaluation and audit-size fields take their current
@@ -230,7 +241,7 @@ class NetworkConfig:
             value["base_model"] = BASE_MODEL
             value["base_revision"] = BASE_MODEL_REVISION
             value.pop("audit_max_logprob_gap", None)
-            value.pop("audit_required_rounds", None)
+            value["audit_required_rounds"] = AUDIT_REQUIRED_ROUNDS
             value.pop("audit_min_exact_match_ratio", None)
             value["audit_rows_per_round"] = AUDIT_ROWS_PER_ROUND
             value["audit_min_fake_row_fraction"] = AUDIT_MIN_FAKE_ROW_FRACTION
@@ -255,7 +266,11 @@ class NetworkConfig:
             # v35 restricts rollout audits to correctly scored rows; v36 pins
             # source-faithful answer extraction and strict static verifiers;
             # v37 adds inert final-answer extraction and permits reasoning
-            # before the final JSON result in code-output prompts.
+            # before the final JSON result in code-output prompts; v38 expands
+            # to randomized 100,000-row, twelve-hour evaluation windows; v39
+            # allocates rows directly from pinned source sizes; v40 adds the
+            # statically verified NuminaMath 1.5 source; v41 assigns future
+            # per-row reasoning budgets and grades only post-think answers.
             for retired in (
                 "math_dataset", "math_revision", "math_rows",
                 "instruction_dataset", "instruction_revision", "instruction_rows",

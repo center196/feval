@@ -1,11 +1,11 @@
 """Deterministic evaluation-window construction from pinned public sources.
 
 Every miner and validator derives byte-identical rows for a window from the
-same immutable revisions, without downloading the sources. Parquet footers give
-a row-group map for free, and a seed drawn from the window number chooses which
-row groups (or, for JSONL, which byte blocks) to read. Rows are normalised into
-one protocol-owned shape, hash-ranked, and ordered by a second hash so no
-source contributes a contiguous block.
+same immutable revisions, without downloading each source in full. Parquet
+footers give a row-group map for free, and a seed revealed by the finalized
+window-boundary block chooses which row groups (or, for JSONL, which byte
+blocks) to read. Rows are normalised into one protocol-owned shape, hash-ranked,
+and ordered by a second hash so no source contributes a contiguous block.
 
 Selection is deliberately conservative: a row is kept only when its answer can
 be settled by exact string comparison. Anything needing a model judge, symbolic
@@ -25,23 +25,29 @@ from ..core.constants import (
     BASE_MODEL,
     EVALUATION_ROWS,
     EVALUATION_SOURCES,
-    GUESS_RESISTANT_ROWS,
     MAX_PROMPT_CHARS,
+    REASONING_BUDGET_LEVELS,
+    REASONING_BUDGET_TOLERANCE_BPS,
     SUBNET_NETUID,
 )
 from ..utils.crypto import hash_json
 from ..utils.jsonutil import write_json, write_jsonl
 from ..protocol.merkle import root_for_values
-from ..protocol.schedule import evaluation_seed
-from .sources import JsonlSource, ParquetSource, Source, describe_source, iter_source_blocks
+from ..protocol.schedule import evaluation_seed, normalize_block_hash
+from .sources import (
+    MAX_SOURCE_SCAN_BPS,
+    JsonlSource,
+    ParquetSource,
+    Source,
+    describe_source,
+    iter_source_blocks,
+)
 from .tasks import NORMALIZERS, REQUIRED_MCQA_OPTIONS
 
-PROTOCOL_EVALUATION_MANIFEST = "feval-dataset-manifest-v6"
-PROTOCOL_TASK_NORMALIZATION = "feval-task-normalization-v3"
+PROTOCOL_EVALUATION_MANIFEST = "feval-dataset-manifest-v10"
+PROTOCOL_TASK_NORMALIZATION = "feval-task-normalization-v5"
 
-VERIFIERS = ("strict_numeric", "mcqa_letter", "json_output_exact")
-GUESS_RESISTANT_VERIFIERS = frozenset({"strict_numeric", "json_output_exact"})
-
+VERIFIERS = ("math_exact", "mcqa_letter", "json_output_exact")
 # A source that cannot fill its quota must fail loudly rather than silently
 # shrink the window, but it must also never pull an unbounded amount of data.
 MAX_BLOCKS_PER_SOURCE = 4_096
@@ -90,10 +96,55 @@ def _rank(seed: str, domain: str, row_id: str) -> int:
     )
 
 
+def reasoning_budget_for_row(seed: str, row_id: str) -> int:
+    """Choose a fixed level from randomness revealed at the window boundary."""
+
+    if not seed or not row_id:
+        raise ValueError("reasoning budget requires a seed and row ID")
+    index = _rank(seed, "reasoning_budget", row_id) % len(REASONING_BUDGET_LEVELS)
+    return int(REASONING_BUDGET_LEVELS[index])
+
+
+def source_quotas(
+    specs: list[dict[str, Any]],
+    evaluation_rows: int,
+) -> dict[str, int]:
+    """Allocate rows directly by pinned source size using largest remainders."""
+
+    if evaluation_rows <= 0:
+        raise ValueError("evaluation row count must be positive")
+    if not specs:
+        raise ValueError("at least one evaluation source is required")
+    sizes = {str(spec["name"]): int(spec["source_rows"]) for spec in specs}
+    if len(sizes) != len(specs) or any(size <= 0 for size in sizes.values()):
+        raise ValueError("evaluation source names must be unique and sizes positive")
+    total_size = sum(sizes.values())
+    result = {
+        name: evaluation_rows * size // total_size
+        for name, size in sizes.items()
+    }
+    remaining = evaluation_rows - sum(result.values())
+    remainder_order = sorted(
+        sizes,
+        key=lambda name: (
+            -(evaluation_rows * sizes[name] % total_size),
+            name,
+        ),
+    )
+    for name in remainder_order[:remaining]:
+        result[name] += 1
+    if any(count <= 0 for count in result.values()):
+        raise ValueError("evaluation is too small for every source to contribute")
+    if sum(result.values()) != evaluation_rows:
+        raise RuntimeError("source quotas do not sum to the evaluation row count")
+    return result
+
+
 def select_from_source(
     spec: dict[str, Any],
     *,
     seed: str,
+    quota: int,
     max_prompt_chars: int = MAX_PROMPT_CHARS,
     token: str | bool | None = False,
     progress: Callable[[str, int, int], None] | None = None,
@@ -113,7 +164,9 @@ def select_from_source(
 
     source = build_source(spec)
     normalize = NORMALIZERS[spec["name"]]
-    quota = int(spec["rows"])
+    quota = int(quota)
+    if quota <= 0:
+        raise ValueError("source quota must be positive")
     pool: list[dict[str, Any]] = []
     if seen is None:
         seen = set()
@@ -128,9 +181,10 @@ def select_from_source(
         blocks += 1
         for raw in block:
             scanned += 1
-            row = normalize(raw, scanned)
-            if row is None:
+            normalized = normalize(raw, scanned)
+            if normalized is None:
                 continue
+            row = {**normalized, "category": str(spec["category"])}
             if row["verifier"] != spec["verifier"]:
                 raise ValueError(
                     f"source {spec['name']} produced verifier {row['verifier']!r}, "
@@ -187,6 +241,7 @@ def _require_unique_row_ids(rows: list[dict[str, Any]]) -> None:
 def build_evaluation_window(
     *,
     window: int,
+    boundary_block_hash: str,
     netuid: int = SUBNET_NETUID,
     sources: Iterable[dict[str, Any]] = EVALUATION_SOURCES,
     evaluation_rows: int = EVALUATION_ROWS,
@@ -196,8 +251,10 @@ def build_evaluation_window(
     token: str | bool | None = False,
     progress: Callable[[str, int, int], None] | None = None,
 ) -> dict[str, Any]:
+    boundary_block_hash = normalize_block_hash(boundary_block_hash)
     specs = list(sources)
-    seed = evaluation_seed(netuid, window)
+    seed = evaluation_seed(netuid, window, boundary_block_hash)
+    quotas = source_quotas(specs, evaluation_rows)
     kept: list[dict[str, Any]] = []
     # One set for the whole window, so a later source never repeats a question
     # an earlier one already claimed. Source order is fixed, so which of two
@@ -208,6 +265,7 @@ def build_evaluation_window(
             select_from_source(
                 spec,
                 seed=seed,
+                quota=quotas[str(spec["name"])],
                 max_prompt_chars=max_prompt_chars,
                 token=token,
                 progress=progress,
@@ -218,6 +276,8 @@ def build_evaluation_window(
         raise ValueError(
             f"evaluation window holds {len(kept)} rows; the protocol requires {evaluation_rows}"
         )
+    for row in kept:
+        row["reasoning_budget_tokens"] = reasoning_budget_for_row(seed, str(row["row_id"]))
     # Interleave the sources so a rollout cannot be timed or truncated by task.
     kept.sort(
         key=lambda row: hashlib.sha256(
@@ -226,20 +286,17 @@ def build_evaluation_window(
     )
     _require_unique_row_ids(kept)
     by_task = {}
+    by_category = {}
     by_verifier = {}
     by_license = {}
+    by_reasoning_budget = {}
     for row in kept:
         by_task[row["task_type"]] = by_task.get(row["task_type"], 0) + 1
+        by_category[row["category"]] = by_category.get(row["category"], 0) + 1
         by_verifier[row["verifier"]] = by_verifier.get(row["verifier"], 0) + 1
         by_license[str(row.get("license"))] = by_license.get(str(row.get("license")), 0) + 1
-    guess_resistant = sum(
-        count for name, count in by_verifier.items() if name in GUESS_RESISTANT_VERIFIERS
-    )
-    if guess_resistant < GUESS_RESISTANT_ROWS:
-        raise ValueError(
-            f"window holds {guess_resistant} guess-resistant rows; "
-            f"the protocol requires at least {GUESS_RESISTANT_ROWS}"
-        )
+        budget = str(int(row["reasoning_budget_tokens"]))
+        by_reasoning_budget[budget] = by_reasoning_budget.get(budget, 0) + 1
     manifest = {
         "protocol": PROTOCOL_EVALUATION_MANIFEST,
         "normalization_protocol": PROTOCOL_TASK_NORMALIZATION,
@@ -248,16 +305,26 @@ def build_evaluation_window(
         "base_model": BASE_MODEL,
         "netuid": netuid,
         "dataset_window": window,
+        "boundary_block_hash": boundary_block_hash,
         "evaluation_seed": seed,
         "rows": len(kept),
         "tasks": by_task,
+        "categories": by_category,
         "verifiers": by_verifier,
         "licenses": by_license,
-        "guess_resistant_rows": guess_resistant,
+        "reasoning_budget_tokens": by_reasoning_budget,
+        "reasoning_budget_levels": list(REASONING_BUDGET_LEVELS),
+        "reasoning_budget_tolerance_bps": REASONING_BUDGET_TOLERANCE_BPS,
         "max_prompt_chars": max_prompt_chars,
         "sources": [
-            {**describe_source(build_source(spec)), "rows": int(spec["rows"]),
-             "verifier": spec["verifier"], "license": spec["license"]}
+            {
+                **describe_source(build_source(spec)),
+                "rows": quotas[str(spec["name"])],
+                "source_rows": int(spec["source_rows"]),
+                "category": spec["category"],
+                "verifier": spec["verifier"],
+                "license": spec["license"],
+            }
             for spec in specs
         ],
         "evaluation_root": root_for_values(kept),
@@ -268,6 +335,10 @@ def build_evaluation_window(
                 "max_prompt_chars": max_prompt_chars,
                 "verifiers": list(VERIFIERS),
                 "required_mcqa_options": REQUIRED_MCQA_OPTIONS,
+                "sampling": "source_size_largest_remainder",
+                "max_source_scan_bps": MAX_SOURCE_SCAN_BPS,
+                "reasoning_budget_levels": list(REASONING_BUDGET_LEVELS),
+                "reasoning_budget_tolerance_bps": REASONING_BUDGET_TOLERANCE_BPS,
                 "prompt_rejection_patterns": [
                     "url",
                     "script",
@@ -290,6 +361,7 @@ def prepare_window_from_config(
     config: NetworkConfig,
     *,
     window: int,
+    boundary_block_hash: str,
     out_path: str | Path,
     manifest_path: str | Path,
     token: str | bool | None = False,
@@ -304,6 +376,7 @@ def prepare_window_from_config(
             )
     return build_evaluation_window(
         window=window,
+        boundary_block_hash=boundary_block_hash,
         netuid=config.netuid,
         evaluation_rows=config.evaluation_rows,
         max_prompt_chars=config.max_prompt_chars,

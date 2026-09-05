@@ -11,8 +11,12 @@ from ..utils.jsonutil import load_json, write_json, write_jsonl
 from ..protocol.merkle import root_for_values
 
 
-PROTOCOL_RESULTS_MANIFEST = "feval-results-v2"
-SUPPORTED_RESULTS_MANIFESTS = {"feval-results-v1", PROTOCOL_RESULTS_MANIFEST}
+PROTOCOL_RESULTS_MANIFEST = "feval-results-v3"
+SUPPORTED_RESULTS_MANIFESTS = {
+    "feval-results-v1",
+    "feval-results-v2",
+    PROTOCOL_RESULTS_MANIFEST,
+}
 
 
 def _load_jsonl_exact(path: str | Path) -> list[dict[str, Any]]:
@@ -96,6 +100,9 @@ def result_rows_from_state(state: dict[str, Any]) -> list[dict[str, Any]]:
             "status": status,
             "audit_status": audit_status,
             "score": float(result.get("score", 0.0)),
+            "raw_score": result.get("raw_score"),
+            "category_scores": result.get("category_scores"),
+            "category_rows": result.get("category_rows"),
             "final_weight": final_weight,
             "correct": result.get("correct"),
             "rows": result.get("rows"),

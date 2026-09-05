@@ -9,6 +9,16 @@ from ..core.constants import DATASET_WINDOW_BLOCKS
 from ..utils.jsonutil import canonical_json_bytes
 
 
+def normalize_block_hash(value: str) -> str:
+    """Return one canonical representation for a 32-byte chain block hash."""
+
+    normalized = str(value).strip().lower()
+    payload = normalized[2:] if normalized.startswith("0x") else normalized
+    if len(payload) != 64 or any(character not in "0123456789abcdef" for character in payload):
+        raise ValueError("block hash must contain exactly 32 hexadecimal bytes")
+    return f"0x{payload}"
+
+
 def dataset_window(block: int, window_blocks: int = DATASET_WINDOW_BLOCKS) -> int:
     """Return the cross-machine dataset window.
 
@@ -24,10 +34,16 @@ def dataset_window(block: int, window_blocks: int = DATASET_WINDOW_BLOCKS) -> in
     return block // window_blocks
 
 
-def evaluation_seed(netuid: int, window: int) -> str:
+def evaluation_seed(netuid: int, window: int, boundary_block_hash: str) -> str:
+    boundary_block_hash = normalize_block_hash(boundary_block_hash)
     return hashlib.sha256(
         canonical_json_bytes(
-            {"domain": "feval/evaluation/v2", "netuid": netuid, "window": window}
+            {
+                "domain": "feval/evaluation/v3",
+                "netuid": netuid,
+                "window": window,
+                "boundary_block_hash": boundary_block_hash,
+            }
         )
     ).hexdigest()
 
@@ -41,6 +57,7 @@ def audit_seed(
     rollout_revision: str,
     round_number: int,
 ) -> str:
+    block_hash = normalize_block_hash(block_hash)
     return hashlib.sha256(
         canonical_json_bytes(
             {

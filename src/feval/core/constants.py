@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 
-PROTOCOL_NETWORK = "feval-network-v37"
+PROTOCOL_NETWORK = "feval-network-v41"
 PROTOCOL_MODEL_COMMITMENT = "f3"
 PROTOCOL_MODEL_MANIFEST = "feval-model-v4"
-PROTOCOL_ROLLOUT_MANIFEST = "feval-rollouts-v20"
-PROTOCOL_VALIDATOR_STATE = "feval-validator-state-v35"
-PROTOCOL_MINER_ROLLOUT_STATE = "feval-miner-rollout-state-v18"
+PROTOCOL_ROLLOUT_MANIFEST = "feval-rollouts-v24"
+PROTOCOL_VALIDATOR_STATE = "feval-validator-state-v39"
+PROTOCOL_MINER_ROLLOUT_STATE = "feval-miner-rollout-state-v22"
 
 SUBNET_NETUID = 47
 PUBLIC_WANDB_ENTITY = "feval196-feval"
@@ -50,9 +50,12 @@ EVALUATION_SOURCES: tuple[dict, ...] = (
         "revision": "d3d08664755704f422af97d43a7ff0ded4bd95df",
         "files": tuple(f"data/cot-{index:05d}-of-00144.parquet" for index in range(144)),
         "columns": ("problem", "expected_answer", "problem_type"),
-        "verifier": "strict_numeric",
+        "category": "math",
+        "verifier": "math_exact",
         "license": "cc-by-4.0",
-        "rows": 3_000,
+        # Exact row count of the pinned cot split. This is a sampling weight,
+        # not a per-window quota; runtime still reads only seeded row groups.
+        "source_rows": 3_201_061,
     },
     {
         "name": "crossthink_math",
@@ -61,9 +64,27 @@ EVALUATION_SOURCES: tuple[dict, ...] = (
         "revision": "a4ce9a3b9434c5f231e2cbe30696d9a721c11d69",
         "files": ("Data/Nemotron-CrossThink-Math.jsonl",),
         "columns": (),
-        "verifier": "strict_numeric",
+        "category": "math",
+        "verifier": "math_exact",
         "license": "cc-by-4.0",
-        "rows": 1_500,
+        "source_rows": 99_880,
+    },
+    {
+        "name": "numina_math_1_5",
+        "kind": "parquet",
+        "repo": "AI-MO/NuminaMath-1.5",
+        "revision": "1b05109f9e5c1ad06c0663519502416c30b300f8",
+        "files": tuple(f"data/train-{index:05d}-of-00003.parquet" for index in range(3)),
+        # The long solution trace is not needed for grading and is never read.
+        "columns": (
+            "problem",
+            "answer",
+            "question_type",
+        ),
+        "category": "math",
+        "verifier": "math_exact",
+        "license": "apache-2.0",
+        "source_rows": 896_215,
     },
     {
         "name": "knowledge_mcqa",
@@ -78,9 +99,10 @@ EVALUATION_SOURCES: tuple[dict, ...] = (
             "template_metadata",
             "options",
         ),
+        "category": "mcqa",
         "verifier": "mcqa_letter",
         "license": "cc-by-4.0",
-        "rows": 2_000,
+        "source_rows": 617_020,
     },
     {
         "name": "open_science",
@@ -91,9 +113,12 @@ EVALUATION_SOURCES: tuple[dict, ...] = (
         # 'output' holds a long reasoning trace Feval never reads. Omitting it
         # takes a row group from 1.9 GB to about 133 MB on the wire.
         "columns": ("expected_answer", "input"),
+        "category": "mcqa",
         "verifier": "mcqa_letter",
         "license": "cc-by-4.0",
-        "rows": 1_500,
+        # The single original Parquet file is only partially indexed by the
+        # Hub viewer; the protocol pins the viewer's published estimate.
+        "source_rows": 802_666,
     },
     {
         "name": "code_understanding",
@@ -102,35 +127,41 @@ EVALUATION_SOURCES: tuple[dict, ...] = (
         "revision": "106a1cec075ae29b8dc07e355a29ddce2cf0745b",
         "files": ("data/train-00000-of-00001.parquet",),
         "columns": ("problem_id", "prompt", "verification_info"),
+        "category": "code",
         "verifier": "json_output_exact",
         # Apache-2.0 through PrimeIntellect/SYNTHETIC-1, which names this repo
         # in its own hf_dataset_name column. See THIRD_PARTY_NOTICES.md.
         "license": "apache-2.0",
-        "rows": 2_000,
+        "source_rows": 60_621,
     },
 )
 
-EVALUATION_ROWS = 10_000
-# Rows whose answer space makes blind guessing worthless. Keeping this the
-# clear majority bounds the score a miner can reach without a real model.
-GUESS_RESISTANT_ROWS = 6_500
-# Keep each deterministic 10,000-row evaluation set active for approximately
-# two days at Bittensor's target of one finalized block every 12 seconds.
-DATASET_WINDOW_BLOCKS = 2 * 24 * 60 * 5
+EVALUATION_ROWS = 100_000
+# Every source contributes in direct proportion to the size of its pinned
+# selected split. There are no hand-maintained dataset/category ratios.
+# Keep each deterministic 100,000-row evaluation set active for approximately
+# twelve hours at Bittensor's target of one finalized block every 12 seconds.
+DATASET_WINDOW_BLOCKS = 12 * 60 * 5
+# The boundary-block seed assigns one target independently to every selected
+# row. A response earns correctness only when its single <think> block is
+# within ten percent of that target under the pinned tokenizer.
+REASONING_BUDGET_LEVELS = (1_024, 2_048, 4_096, 8_192, 16_384)
+REASONING_BUDGET_TOLERANCE_BPS = 1_000
 WEIGHT_INTERVAL_BLOCKS = 150
 AUDIT_DELAY_BLOCKS = 5
 AUDIT_ROWS_PER_ROUND = 32
+AUDIT_REQUIRED_ROUNDS = 30
 # Only correctly answered rows can contribute to a miner's score, so audit
 # sampling is restricted to that population. Thirty-two distinct correct rows
-# are checked per round. Ten successful rounds check 320 rows and provide at
-# least a 95% conservative guarantee when 1% or more of the score-contributing
+# are checked per round. Thirty successful rounds check 960 rows and provide
+# more than 99.99% detection probability when at least 1% of score-contributing
 # rows are forged. Incorrect rows cannot improve a miner's score.
 AUDIT_MIN_FAKE_ROW_FRACTION = PROMOTION_DELTA_MIN
-AUDIT_DETECTION_CONFIDENCE = 0.95
-# Ten successful rounds make a revision eligible for emission. Continue
-# auditing that exact immutable revision until twenty rounds have passed so
+AUDIT_DETECTION_CONFIDENCE = 0.9999
+# Thirty successful rounds make a revision eligible for emission. Continue
+# auditing that exact immutable revision until fifty rounds have passed so
 # eligibility is not also the end of ongoing fraud detection.
-AUDIT_TOTAL_ROUNDS = 20
+AUDIT_TOTAL_ROUNDS = 50
 # BF16 decode and teacher-forced kernels can reorder a few close logits across
 # supported GPUs. Bound that numerical tolerance while requiring almost every
 # audited token to remain the exact rank-one choice.
@@ -158,10 +189,9 @@ MAX_ADAPTER_BYTES = 256 * 1024 * 1024
 MAX_ADAPTER_ELEMENTS = 100_000_000
 MAX_TENSOR_DIMENSION = 65_536
 MAX_ADAPTER_CONFIG_BYTES = 64 * 1024
-# The aggregate cap remains deliberately much smaller than 10,000 worst-case
-# 32K rows. This bounds untrusted downloads and host-memory use while allowing
-# individual long reasoning traces; miners must terminate ordinary rows early.
-MAX_ROLLOUT_BYTES = 256 * 1024 * 1024
+# Mandatory long reasoning makes a compliant 100,000-row JSONL bundle several
+# gigabytes. Keep a finite cap while allowing the expected five-level mix.
+MAX_ROLLOUT_BYTES = 8 * 1024 * 1024 * 1024
 MAX_ROLLOUT_LINE_BYTES = 256 * 1024
 MAX_MANIFEST_BYTES = 64 * 1024
 

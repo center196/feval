@@ -41,23 +41,33 @@ unhackable.
 A finalized commitment binds a model repository, immutable model revision,
 semantic model digest, and rollout repository. The rollout manifest binds the
 same model to one dataset window, evaluation seed, evaluation Merkle root, and
-the SHA-256 digest of all 10,000 ordered rollout rows.
+the SHA-256 digest of all 100,000 ordered rollout rows.
 
 Generation is deterministic greedy decoding under a miner-selected limit from
 1 through 32,768 tokens. Validators enforce the manifest's exact limit and the
-code-pinned 32,768-token combined prompt-and-response context. After a future
-finalized block makes the sample unpredictable, validators teacher-force up to
-32 distinct correctly answered rows per round through the committed adapter.
+code-pinned 32,768-token combined prompt-and-response context. A model is
+eligible for a window only if it was committed before that window's first
+block. The finalized boundary-block hash then reveals the 100,000-row sample.
+That same future seed assigns each row a reasoning target from 1,024, 2,048,
+4,096, 8,192, or 16,384 tokens. The protocol prompt requires one leading
+`<think>...</think>` block and accepts a token count within ±10% of the target.
+Only the pinned tokenizer's token IDs between the opening and first closing tag
+count. Post-think text has no separate target and alone reaches the answer
+verifier. A malformed or out-of-range reasoning block receives zero reward.
+After a separate future finalized block makes each audit sample unpredictable,
+validators teacher-force up to 32 distinct correctly answered rows per round
+through the committed adapter.
 Incorrect rows cannot improve a miner's score and are excluded from the audit
-population. The 256 MiB aggregate
+population. The 8 GiB aggregate
 bundle cap prevents miners from turning flexible generation budgets into an
 unbounded download. Every submitted token must rank within the top three and
 remain within a 0.25 logprob gap; at least 99.5% of audited tokens must still
-be exact rank one. Ten successful rounds normally cover 320 distinct correct
+be exact rank one. Thirty successful rounds normally cover 960 distinct correct
 rows before eligibility; smaller correct populations are fully covered sooner.
-Twenty rounds continue monitoring the same immutable revision when enough
-correct rows exist. Sampling 320 rows detects at least one when 1% of the
-score-contributing population is forged with at least 95% probability.
+Once all participating miners have reached that gate or terminated, fifty
+rounds continue monitoring each valid immutable revision. Sampling 960 rows
+without replacement detects at least one forged row when 1% of a 100,000-row
+score-contributing population is forged with greater than 99.99% probability.
 
 This is strong statistical evidence that the sampled traces are greedy outputs
 of the committed model. It is not a cryptographic proof that every unaudited
@@ -81,13 +91,30 @@ Production miner and validator commands expose no local dataset path, scan
 limit, or protocol context-cap override. Changing a dataset or verifier requires a
 reviewed protocol release adopted by validators and miners.
 
-The math verifier statically extracts a final answer from reviewed wrappers and
-then accepts only a strictly parsed integer, decimal, or simple fraction.
-Symbolic algebra and proof answers in the wider NVIDIA math dataset are filtered
-out. It does not fall back to an arbitrary trailing number. CrossThink prompts
-that visibly request multiple answers are also excluded because their scalar
-label is ambiguous. This is safe and fast, but it is not a replacement for
-NVIDIA NeMo-Skills' full symbolic math grading.
+Each twelve-hour window contains exactly 100,000 rows selected from six full
+pinned public sources, whose raw candidate union contains well over one million
+rows. Source quotas are calculated by largest remainder in direct proportion
+to pinned selected-split sizes; no manual dataset or category ratio is used.
+Every row has equal score weight. Source and category breakdowns are diagnostic
+only. The runtime reads seeded Parquet row groups and relevant columns, or
+seeded one-megabyte JSONL byte blocks, until each quota is filled. It does not
+download a whole source and fails closed if a quota cannot be filled. Even the
+failure path is capped at 90% of independently addressable source blocks; a
+single-block file is the unavoidable minimum, and Parquet still transfers only
+the pinned column chunks.
+
+Public rows may recur across windows. The boundary seed prevents targeting the
+exact next sample before model commitment, but it is not data secrecy and does
+not claim a 180-day no-reuse period. Such a period at two 100,000-row windows
+per day would require 36 million distinct eligible rows.
+
+The math verifier statically extracts a final answer from reviewed wrappers,
+normalizes only presentation whitespace and outer wrappers, and compares the
+result exactly. Every answer-bearing math row may remain, including symbolic or
+multiple-value answers; proof and missing-answer rows are excluded. It never
+simplifies or evaluates an expression, invokes SymPy, or falls back to an
+arbitrary trailing number. Consequently, mathematically equivalent strings may
+score differently by design.
 
 MCQA grading uses reviewed local patterns and, where the source supplies them,
 requires declared option keys to agree with the rendered prompt. Code-output
@@ -110,7 +137,7 @@ leaving the current miner set removes that priority. Validators do not require
 historical block scans or an archive RPC endpoint.
 
 UID 0 receives 90% of weight. The highest-scoring currently registered miner
-that has completed the required audit rounds receives the remaining 10%.
+that has completed 30 successful audit rounds receives the remaining 10%.
 Duplicate submissions are excluded, and score ties resolve by lowest UID and
 then hotkey. With no eligible miner, UID 0 receives 100%. King promotion remains
 separate and requires the configured statistical lower bound to clear the 1%
@@ -118,7 +145,7 @@ margin.
 
 ## Resource limits and residual risks
 
-- Adapters are limited to 256 MiB. Rollouts are limited to 256 MiB total and
+- Adapters are limited to 256 MiB. Rollouts are limited to 8 GiB total and
   256 KiB per JSONL row; manifests and adapter JSON are limited to 64 KiB.
 - Audit inference uses one active sequence, a 60% GPU-memory target, and
   4,096-token prompt-logprob chunks. Operators must still enforce container

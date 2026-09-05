@@ -12,6 +12,7 @@ from pathlib import Path
 from ..chain import publish_commitment, serve_axon, set_weights
 from ..core.config import NetworkConfig, load_network_config
 from ..core.constants import (
+    AUDIT_TOTAL_ROUNDS,
     DEFAULT_ROLLOUT_BATCH_SIZE,
     MAX_OUTPUT_TOKENS,
     SUBNET_NETUID,
@@ -85,6 +86,7 @@ def cmd_dataset_prepare(args: argparse.Namespace) -> None:
     try:
         manifest = build_evaluation_window(
             window=args.window,
+            boundary_block_hash=args.boundary_block_hash,
             netuid=args.netuid,
             out_path=args.out,
             manifest_path=args.manifest,
@@ -332,9 +334,9 @@ def cmd_miner_leaderboard(args: argparse.Namespace) -> None:
             return f"VALID {score:.4f}"
         status = str(row.get("audit_status") or row.get("status") or "invalid").lower()
         if status == "auditing":
-            return f"AUDIT {int(row.get('audit_round') or 0)}/{int(row.get('audit_total_rounds') or 20)}"
+            return f"AUDIT {int(row.get('audit_round') or 0)}/{int(row.get('audit_total_rounds') or AUDIT_TOTAL_ROUNDS)}"
         if status == "retrying":
-            return f"RETRY {int(row.get('audit_round') or 0)}/{int(row.get('audit_total_rounds') or 20)}"
+            return f"RETRY {int(row.get('audit_round') or 0)}/{int(row.get('audit_total_rounds') or AUDIT_TOTAL_ROUNDS)}"
         if status == "blacklisted":
             return "BLACKLIST"
         return "INVALID"
@@ -563,7 +565,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Build one deterministic evaluation window from the pinned sources.",
         formatter_class=FevalHelpFormatter,
     )
-    prepare.add_argument("--window", type=int, required=True, help="Dataset window number (finalized block // 14400).")
+    prepare.add_argument("--window", type=int, required=True, help="Dataset window number (finalized block // 3600).")
+    prepare.add_argument(
+        "--boundary-block-hash",
+        required=True,
+        help="Finalized hash of the first block in this window.",
+    )
     prepare.add_argument("--netuid", type=int, default=SUBNET_NETUID)
     prepare.add_argument("--verbose", action="store_true", help="Report per-source scan progress.")
     prepare.add_argument("--out", required=True)
@@ -633,7 +640,7 @@ def build_parser() -> argparse.ArgumentParser:
     rollout = miner_sub.add_parser(
         "rollout",
         help=(
-            "Run greedy vLLM inference for the current 10,000-row window and update "
+            "Run greedy vLLM inference for the current 100,000-row window and update "
             "the Hugging Face rollout dataset repo from this hotkey's on-chain model commitment."
         ),
         formatter_class=FevalHelpFormatter,
@@ -660,6 +667,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=MAX_OUTPUT_TOKENS,
         help=(
             f"Preferred generation budget per row, from 1 to {MAX_OUTPUT_TOKENS}; "
+            "must leave room for the row's future 1K-16K reasoning level; "
             "prompt plus response never exceeds the 32K context limit."
         ),
     )
@@ -695,6 +703,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=MAX_OUTPUT_TOKENS,
         help=(
             f"Preferred generation budget per row, from 1 to {MAX_OUTPUT_TOKENS}; "
+            "must leave room for the row's future 1K-16K reasoning level; "
             "prompt plus response never exceeds the 32K context limit."
         ),
     )

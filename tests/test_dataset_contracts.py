@@ -4,12 +4,13 @@ import json
 import string
 import unittest
 
-from feval.datasets.rewards import reward_answer
+from feval.datasets.rewards import canonical_math_answer, reward_answer
 from feval.datasets.tasks import (
     CODE_OUTPUT_SUFFIX,
     normalize_code_understanding,
     normalize_crossthink_math,
     normalize_knowledge_mcqa,
+    normalize_numina_math_1_5,
     normalize_open_math_reasoning,
     normalize_open_science,
 )
@@ -35,7 +36,34 @@ def declared_options(letters: str = LETTERS) -> list[dict[str, str | None]]:
 
 
 class DatasetNormalizerContractTests(unittest.TestCase):
-    def test_open_math_uses_only_extracted_simple_numeric_answer(self) -> None:
+    def test_numina_keeps_every_answer_bearing_non_proof_problem(self) -> None:
+        base = {
+            "problem": "A box has 6 rows of 7 items. How many items are there?",
+            "answer": r"\boxed{42}",
+            "question_type": "math-word-problem",
+            "problem_is_valid": "Yes",
+            "solution_is_valid": "Yes",
+        }
+        accepted = normalize_numina_math_1_5(base, 1)
+        self.assertIsNotNone(accepted)
+        self.assertEqual(accepted["expected"], ["42"])
+        self.assertEqual(accepted["source_dataset"], "AI-MO/NuminaMath-1.5")
+
+        for change in (
+            {"question_type": "proof", "answer": "proof"},
+            {"answer": "notfound"},
+            {"answer": ""},
+        ):
+            with self.subTest(change=change):
+                self.assertIsNone(normalize_numina_math_1_5({**base, **change}, 2))
+        symbolic = normalize_numina_math_1_5({**base, "answer": r"\sqrt{2}"}, 3)
+        self.assertIsNotNone(symbolic)
+        self.assertEqual(symbolic["expected"], [r"\sqrt{2}"])
+        multiple = normalize_numina_math_1_5({**base, "answer": "0 or 3"}, 4)
+        self.assertIsNotNone(multiple)
+        self.assertEqual(multiple["expected"], ["0 or 3"])
+
+    def test_open_math_keeps_extracted_symbolic_answers(self) -> None:
         accepted = normalize_open_math_reasoning(
             {
                 "problem_type": "has_answer_extracted",
@@ -45,7 +73,7 @@ class DatasetNormalizerContractTests(unittest.TestCase):
             1,
         )
         self.assertIsNotNone(accepted)
-        self.assertEqual(accepted["expected"], ["1/2"])
+        self.assertEqual(accepted["expected"], [r"\frac{1}{2}"])
 
         self.assertIsNone(
             normalize_open_math_reasoning(
@@ -57,18 +85,18 @@ class DatasetNormalizerContractTests(unittest.TestCase):
                 2,
             )
         )
-        self.assertIsNone(
-            normalize_open_math_reasoning(
-                {
-                    "problem_type": "has_answer_extracted",
-                    "problem": "Find x.",
-                    "expected_answer": r"\sqrt{2}",
-                },
-                3,
-            )
+        symbolic = normalize_open_math_reasoning(
+            {
+                "problem_type": "has_answer_extracted",
+                "problem": "Find x.",
+                "expected_answer": r"\sqrt{2}",
+            },
+            3,
         )
+        self.assertIsNotNone(symbolic)
+        self.assertEqual(symbolic["expected"], [r"\sqrt{2}"])
 
-    def test_crossthink_rejects_ambiguous_multi_answer_prompts(self) -> None:
+    def test_crossthink_keeps_answer_bearing_prompts(self) -> None:
         base = {"reward_model": {"style": "rule", "ground_truth": "2"}}
         accepted = normalize_crossthink_math(
             {**base, "meta_data": {"index": 1, "question": "What is 1 + 1?"}},
@@ -77,8 +105,7 @@ class DatasetNormalizerContractTests(unittest.TestCase):
         self.assertIsNotNone(accepted)
         self.assertEqual(accepted["expected"], ["2"])
 
-        self.assertIsNone(
-            normalize_crossthink_math(
+        multiple = normalize_crossthink_math(
                 {
                     **base,
                     "meta_data": {
@@ -88,9 +115,8 @@ class DatasetNormalizerContractTests(unittest.TestCase):
                 },
                 2,
             )
-        )
-        self.assertIsNone(
-            normalize_crossthink_math(
+        self.assertIsNotNone(multiple)
+        numbered = normalize_crossthink_math(
                 {
                     **base,
                     "meta_data": {
@@ -100,7 +126,7 @@ class DatasetNormalizerContractTests(unittest.TestCase):
                 },
                 3,
             )
-        )
+        self.assertIsNotNone(numbered)
 
     def test_knowledge_mcqa_accepts_source_declared_a_paren_options(self) -> None:
         row = {
@@ -149,8 +175,8 @@ class DatasetNormalizerContractTests(unittest.TestCase):
         self.assertIsNotNone(accepted)
         self.assertEqual(accepted["expected"], ["a\n b"])
         self.assertTrue(accepted["prompt"].endswith(CODE_OUTPUT_SUFFIX))
-        self.assertIn("may include a long reasoning trace", accepted["prompt"])
-        self.assertIn("End with a JSON object", accepted["prompt"])
+        self.assertIn("After the required reasoning block", accepted["prompt"])
+        self.assertIn("end with a JSON object", accepted["prompt"])
 
         self.assertIsNone(
             normalize_code_understanding(
@@ -175,12 +201,17 @@ class DatasetNormalizerContractTests(unittest.TestCase):
 
 
 class RewardContractTests(unittest.TestCase):
-    def test_strict_numeric_is_exact_rational_equality(self) -> None:
-        self.assertEqual(reward_answer("0.5", ["1/2"], verifier="strict_numeric"), 1)
-        self.assertEqual(reward_answer("0.333", ["1/3"], verifier="strict_numeric"), 0)
-        self.assertEqual(reward_answer("about 2", ["2"], verifier="strict_numeric"), 0)
+    def test_math_exact_does_not_infer_equivalence(self) -> None:
+        self.assertEqual(reward_answer("0.5", ["0.5"], verifier="math_exact"), 1)
+        self.assertEqual(reward_answer("0.5", ["1/2"], verifier="math_exact"), 0)
+        self.assertEqual(reward_answer(r"\sqrt{2}", [r"\sqrt{2}"], verifier="math_exact"), 1)
+        self.assertEqual(reward_answer("x + y", ["y + x"], verifier="math_exact"), 0)
 
-    def test_strict_numeric_extracts_static_final_answer_forms(self) -> None:
+    def test_math_exact_keeps_numeric_zero(self) -> None:
+        self.assertEqual(canonical_math_answer(0), "0")
+        self.assertEqual(reward_answer("Answer: 0", [0], verifier="math_exact"), 1)
+
+    def test_math_exact_extracts_static_final_answer_forms(self) -> None:
         reasoning = "We compute the two terms and obtain 40 + 2."
         accepted = (
             reasoning + r" Therefore, \boxed{42}",
@@ -188,28 +219,39 @@ class RewardContractTests(unittest.TestCase):
             reasoning + "\nThe answer is 42.",
             reasoning + "\nFinal answer: 42",
             reasoning + "\n" + r"<answer>\boxed{42}</answer>",
-            reasoning + "\n" + r"Final answer: \boxed{\frac{84}{2}}",
         )
         for response in accepted:
             with self.subTest(response=response):
                 self.assertEqual(
-                    reward_answer(response, ["42"], verifier="strict_numeric"),
+                    reward_answer(response, ["42"], verifier="math_exact"),
                     1,
                 )
-
-    def test_strict_numeric_does_not_guess_or_evaluate(self) -> None:
-        rejected = (
-            "First I found 40, then added 2.",
-            r"Final answer: \sqrt{1764}",
-            "Answer: 40 + 2",
-            "Answer: __import__('os').system('echo unsafe')",
+        self.assertEqual(
+            reward_answer(
+                reasoning + "\n" + r"Final answer: \boxed{\frac{84}{2}}",
+                ["42"],
+                verifier="math_exact",
+            ),
+            0,
         )
-        for response in rejected:
-            with self.subTest(response=response):
-                self.assertEqual(
-                    reward_answer(response, ["42"], verifier="strict_numeric"),
-                    0,
-                )
+
+    def test_math_exact_compares_inert_text_without_evaluation(self) -> None:
+        self.assertEqual(
+            reward_answer("Answer: 40 + 2", ["40 + 2"], verifier="math_exact"),
+            1,
+        )
+        self.assertEqual(
+            reward_answer("Answer: 40 + 2", ["42"], verifier="math_exact"),
+            0,
+        )
+        self.assertEqual(
+            reward_answer(
+                "Answer: __import__('os').system('echo unsafe')",
+                ["__import__('os').system('echo unsafe')"],
+                verifier="math_exact",
+            ),
+            1,
+        )
 
     def test_mcqa_uses_static_source_compatible_wrappers(self) -> None:
         self.assertEqual(reward_answer("C", ["C"], verifier="mcqa_letter"), 1)

@@ -31,7 +31,11 @@ from ..core.constants import (
     PROTOCOL_MINER_ROLLOUT_STATE,
     PROTOCOL_VALIDATOR_STATE,
 )
-from ..datasets.dataset import PROTOCOL_EVALUATION_MANIFEST, prepare_window_from_config
+from ..datasets.dataset import (
+    PROTOCOL_EVALUATION_MANIFEST,
+    prepare_window_from_config,
+    source_quotas,
+)
 from ..models.hub import (
     resolve_rollout_revision,
     safe_download_model,
@@ -45,6 +49,7 @@ from ..models.inference import (
     decode_rollout,
     load_protocol_tokenizer,
     protocol_rollout_tokens,
+    split_reasoning_tokens,
     tokenizer_vocab_size,
 )
 from ..utils.jsonutil import load_json, load_jsonl
@@ -57,7 +62,7 @@ from ..protocol.schedule import (
     choose_audit_ids,
     dataset_window,
     evaluation_seed,
-    required_audit_rounds,
+    normalize_block_hash,
 )
 from ..utils.ui import print_rows_table
 
@@ -76,6 +81,12 @@ class DuplicateRolloutError(ValueError):
 
 def _short_hotkey(value: str) -> str:
     return value if len(value) <= 20 else f"{value[:8]}...{value[-6:]}"
+
+
+def _model_precedes_window(*, commit_block: int, window: int, window_blocks: int) -> bool:
+    """Require the model commitment before the block that reveals the sample."""
+
+    return int(commit_block) < int(window) * int(window_blocks)
 
 
 def _validator_progress(status: str, **fields: Any) -> None:
@@ -194,6 +205,10 @@ def _normalize_state(state: Any) -> dict[str, Any]:
         "feval-validator-state-v32",
         "feval-validator-state-v33",
         "feval-validator-state-v34",
+        "feval-validator-state-v35",
+        "feval-validator-state-v36",
+        "feval-validator-state-v37",
+        "feval-validator-state-v38",
     }:
         # Audit semantics changed. Never carry old pass/fail decisions or
         # partial rounds into a different token-validity protocol.
@@ -348,9 +363,11 @@ def ensure_evaluation_files(
     config: NetworkConfig,
     *,
     window: int,
+    boundary_block_hash: str,
     directory: str | Path,
     token: str | bool | None = False,
 ) -> tuple[Path, Path, dict[str, Any]]:
+    boundary_block_hash = normalize_block_hash(boundary_block_hash)
     root = Path(directory)
     root.mkdir(parents=True, exist_ok=True)
     eval_path = root / f"eval-{window}.jsonl"
@@ -362,12 +379,14 @@ def ensure_evaluation_files(
             and manifest.get("kind") == "evaluation_window"
             and manifest.get("candidate_source") == "seeded_row_groups"
             and manifest.get("dataset_window") == window
-            and manifest.get("evaluation_seed") == evaluation_seed(config.netuid, window)
+            and manifest.get("evaluation_seed")
+            == evaluation_seed(config.netuid, window, boundary_block_hash)
+            and manifest.get("boundary_block_hash") == boundary_block_hash
             and manifest.get("evaluation_root") == root_for_values(load_jsonl(eval_path))
             and manifest.get("rows") == config.evaluation_rows
         ):
             return eval_path, manifest_path, manifest
-    quotas = {spec["name"]: int(spec["rows"]) for spec in EVALUATION_SOURCES}
+    quotas = source_quotas(list(EVALUATION_SOURCES), config.evaluation_rows)
     _validator_progress(
         "building_evaluation_from_seeded_row_groups",
         authentication="public",
@@ -377,6 +396,7 @@ def ensure_evaluation_files(
     manifest = prepare_window_from_config(
         config,
         window=window,
+        boundary_block_hash=boundary_block_hash,
         out_path=eval_path,
         manifest_path=manifest_path,
         token=token,
@@ -462,10 +482,21 @@ def publish_miner_rollouts(
     current = max(own, key=lambda row: row["commit_block"])
     commitment: ModelCommitment = current["commitment"]
     window = dataset_window(block, config.dataset_window_blocks)
+    boundary = block_hash(network=network, block=window * config.dataset_window_blocks)
+    if not _model_precedes_window(
+        commit_block=current["commit_block"],
+        window=window,
+        window_blocks=config.dataset_window_blocks,
+    ):
+        raise ValueError(
+            "the current model was committed after this window was revealed; "
+            "it becomes eligible in the next window"
+        )
     work = Path(work_dir)
     eval_path, manifest_path, _ = ensure_evaluation_files(
         config,
         window=window,
+        boundary_block_hash=boundary,
         directory=work / "evaluation",
         token=hf_token or False,
     )
@@ -526,6 +557,10 @@ def _load_miner_rollout_state(work_dir: str | Path) -> dict[str, Any]:
         "feval-miner-rollout-state-v15",
         "feval-miner-rollout-state-v16",
         "feval-miner-rollout-state-v17",
+        "feval-miner-rollout-state-v18",
+        "feval-miner-rollout-state-v19",
+        "feval-miner-rollout-state-v20",
+        "feval-miner-rollout-state-v21",
     }:
         return {"protocol": PROTOCOL_MINER_ROLLOUT_STATE, "last_success": None}
     if not isinstance(state, dict) or state.get("protocol") != PROTOCOL_MINER_ROLLOUT_STATE:
@@ -611,6 +646,19 @@ class MinerRolloutRunner:
             block=block,
         )
         commitment: ModelCommitment = current["commitment"]
+        if not _model_precedes_window(
+            commit_block=current["commit_block"],
+            window=window,
+            window_blocks=self.config.dataset_window_blocks,
+        ):
+            raise ValueError(
+                "the current model was committed after this window was revealed; "
+                "it becomes eligible in the next window"
+            )
+        boundary = block_hash(
+            network=self.network,
+            block=window * self.config.dataset_window_blocks,
+        )
         target = {
             "hotkey": miner_hotkey,
             "dataset_window": window,
@@ -636,6 +684,7 @@ class MinerRolloutRunner:
         eval_path, manifest_path, _ = ensure_evaluation_files(
             self.config,
             window=window,
+            boundary_block_hash=boundary,
             directory=self.work_dir / "evaluation",
             token=self.hf_token or False,
         )
@@ -834,15 +883,51 @@ def score_rollouts(
             tokenizer,
             str(expected["prompt"]),
             list(rollout["tokens"]),
+            reasoning_budget_tokens=int(expected["reasoning_budget_tokens"]),
             max_output_tokens=max_output_tokens,
         )
         if not tokens:
             raise ValueError(f"rollout {rollout['row_id']!r} is empty")
-        answer = decode_rollout(tokenizer, tokens)
-        reward = reward_for_row(answer, expected)
-        scored.append({**rollout, "tokens": tokens, "reward": reward})
-    score = sum(row["reward"] for row in scored) / len(scored) if scored else 0.0
+        reasoning_count = None
+        reasoning_valid = False
+        try:
+            reasoning, answer_tokens = split_reasoning_tokens(
+                tokenizer,
+                tokens,
+                int(expected["reasoning_budget_tokens"]),
+            )
+            reasoning_count = len(reasoning)
+            reasoning_valid = True
+            answer = decode_rollout(tokenizer, answer_tokens)
+            reward = reward_for_row(answer, expected)
+        except ValueError:
+            reward = 0
+        category = str(expected.get("category") or "")
+        if not category:
+            raise ValueError("evaluation row is missing its category")
+        scored.append(
+            {
+                **rollout,
+                "tokens": tokens,
+                "reward": reward,
+                "category": category,
+                "reasoning_budget_tokens": int(expected["reasoning_budget_tokens"]),
+                "reasoning_tokens": reasoning_count,
+                "reasoning_valid": reasoning_valid,
+            }
+        )
+    score = sum(int(row["reward"]) for row in scored) / len(scored) if scored else 0.0
     return score, scored
+
+
+def _category_scores(scored: list[dict[str, Any]]) -> dict[str, float]:
+    scores: dict[str, float] = {}
+    for category in sorted({str(row.get("category") or "") for row in scored}):
+        if not category:
+            raise ValueError("scored row is missing its category")
+        rows = [row for row in scored if row.get("category") == category]
+        scores[category] = sum(int(row["reward"]) for row in rows) / len(rows)
+    return scores
 
 
 def _correct_scored_rows(scored: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1051,7 +1136,7 @@ class ValidatorRunner:
         if getattr(self, "wandb_run_window", None) not in {None, window}:
             self._close_wandb_run()
         # Continue rewarding previously verified miners while the next public
-        # evaluation window accumulates ten successful audit rounds. A current
+        # evaluation window accumulates thirty successful audit rounds. A current
         # valid result replaces that miner's older verified snapshot.
         current_results = self.state.get("results", {})
         carryover = self.state.get("carryover_results", {})
@@ -1214,6 +1299,7 @@ class ValidatorRunner:
                     round_score = score
                     round_correct = sum(int(row["reward"]) for row in scored)
                     round_row_count = len(scored)
+                    round_category_scores = _category_scores(scored)
                     correct_scored = _correct_scored_rows(scored)
                     if not correct_scored:
                         raise ValueError("rollout has no correct rows to audit")
@@ -1258,7 +1344,13 @@ class ValidatorRunner:
                     selected = set(selected_ids)
                     eval_by_id = {row["row_id"]: row for row in eval_rows}
                     audit_rows = [
-                        {**row, "prompt": eval_by_id[row["row_id"]]["prompt"]}
+                        {
+                            **row,
+                            "prompt": eval_by_id[row["row_id"]]["prompt"],
+                            "reasoning_budget_tokens": eval_by_id[row["row_id"]][
+                                "reasoning_budget_tokens"
+                            ],
+                        }
                         for row in correct_scored
                         if row["row_id"] in selected
                     ]
@@ -1301,11 +1393,10 @@ class ValidatorRunner:
                 progress["tokens_checked"] = int(progress.get("tokens_checked", 0)) + tokens_checked
                 if audit_valid:
                     progress["rounds_passed"] = int(progress.get("rounds_passed", 0)) + 1
-                required_rounds = required_audit_rounds(
-                    population=len(correct_scored),
-                    rows_per_round=self.config.audit_rows_per_round,
-                    min_fake_fraction=self.config.audit_min_fake_row_fraction,
-                    confidence=self.config.audit_detection_confidence,
+                required_rounds = min(
+                    self.config.audit_required_rounds,
+                    (len(correct_scored) + self.config.audit_rows_per_round - 1)
+                    // self.config.audit_rows_per_round,
                 )
                 total_rounds = min(
                     self.config.audit_total_rounds,
@@ -1367,9 +1458,17 @@ class ValidatorRunner:
                         )
                     ),
                     "score": score if fully_validated else 0.0,
+                    "raw_score": score,
+                    "category_scores": round_category_scores,
                     "correct": round_correct,
                     "rows": len(scored),
                     "reward_bits": encode_reward_bits([int(row["reward"]) for row in scored]),
+                    "category_rows": {
+                        category: sum(
+                            1 for row in scored if row["category"] == category
+                        )
+                        for category in round_category_scores
+                    },
                     "model_digest": commitment.model_digest,
                     **_commitment_result_fields(commitment),
                     "commit_block": current["commit_block"],
@@ -1394,7 +1493,7 @@ class ValidatorRunner:
                     "error": None
                     if audit_valid
                     else (
-                        "teacher-forced rollout mismatch ("
+                        "rollout is ineligible ("
                         + "; ".join(failed_conditions)
                         + ")"
                         + (f": {failure_summary}" if failure_summary else "")
@@ -1565,6 +1664,7 @@ class ValidatorRunner:
         active_blacklist = _active_blacklist(
             self.state, current_block=current_block, config=self.config
         )
+        resolved: list[tuple[dict[str, Any], str]] = []
         for row in eligible:
             hotkey = row["hotkey"]
             if hotkey in active_blacklist:
@@ -1585,6 +1685,31 @@ class ValidatorRunner:
                     "error": f"recoverable rollout pin failure: {type(exc).__name__}: {exc}",
                 }
                 continue
+            resolved.append((row, revision))
+
+        participants: list[dict[str, Any]] = []
+        for row, revision in resolved:
+            commitment: ModelCommitment = row["commitment"]
+            result = self.state["results"].get(row["hotkey"])
+            if not (
+                isinstance(result, dict)
+                and result.get("model_digest") == commitment.model_digest
+                and result.get("rollout_revision") == revision
+            ):
+                result = {}
+            participants.append(result)
+        initial_phase_complete = all(
+            result.get("audit_status") in {
+                "failed",
+                "copied",
+                "blacklisted",
+            }
+            or int(result.get("audit_round", 0)) >= self.config.audit_required_rounds
+            for result in participants
+        )
+        for row, revision in resolved:
+            hotkey = row["hotkey"]
+            commitment: ModelCommitment = row["commitment"]
             pending = self.state["pending"].get(hotkey)
             if (
                 isinstance(pending, dict)
@@ -1608,6 +1733,10 @@ class ValidatorRunner:
             if isinstance(previous, dict) and previous.get("audit_total_rounds") is not None:
                 total_rounds = int(previous["audit_total_rounds"])
             previous_round = int(previous.get("audit_round", 0)) if isinstance(previous, dict) else 0
+            if not initial_phase_complete and previous_round >= self.config.audit_required_rounds:
+                # Finish the initial eligibility cohort before spending GPU time
+                # on continued monitoring of miners that already passed it.
+                continue
             if (
                 isinstance(previous, dict)
                 and previous.get("model_digest") == commitment.model_digest
@@ -1775,27 +1904,40 @@ class ValidatorRunner:
         _validator_progress("reading_finalized_chain")
         current_block = finalized_block(network=self.network)
         window = dataset_window(current_block, self.config.dataset_window_blocks)
+        boundary = block_hash(
+            network=self.network,
+            block=window * self.config.dataset_window_blocks,
+        )
         if self.state.get("window") != window:
             self._reset_window(window)
         _validator_progress("preparing_evaluation", block=current_block, window=window)
         eval_path, _, eval_manifest = ensure_evaluation_files(
             self.config,
             window=window,
+            boundary_block_hash=boundary,
             directory=self.work_dir / "evaluation",
             token=self.hf_token or False,
         )
         _validator_progress("reading_current_commitments", block=current_block)
-        rows = _current_commitments(
-            [
-                row
-                for row in read_model_commitments(
-                    netuid=self.config.netuid,
-                    network=self.network,
-                    block=current_block,
-                )
-                if row.get("uid") is not None
-            ]
-        )
+        rows = [
+            row
+            for row in _current_commitments(
+                [
+                    row
+                    for row in read_model_commitments(
+                        netuid=self.config.netuid,
+                        network=self.network,
+                        block=current_block,
+                    )
+                    if row.get("uid") is not None
+                ]
+            )
+            if _model_precedes_window(
+                commit_block=row.get("commit_block", -1),
+                window=window,
+                window_blocks=self.config.dataset_window_blocks,
+            )
+        ]
         _validator_progress("current_commitments_ready", miners=len(rows))
         eligible, copies = _copy_filtered(rows)
         current = {row["hotkey"]: row for row in rows}

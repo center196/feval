@@ -8,7 +8,7 @@ regular expressions, and verifier metadata are never compiled or executed.
 
 Only three verifiers exist, and all three are pure string work:
 
-* ``strict_numeric``     static final-answer extraction and exact rational match
+* ``math_exact``         static final-answer extraction and normalized exact match
 * ``mcqa_letter``        one option letter
 * ``json_output_exact``  final JSON extraction and exact predicted-output match
 
@@ -22,19 +22,18 @@ import hashlib
 import re
 from typing import Any, Callable
 
-from .rewards import canonical_numeric_answer
+from .rewards import canonical_math_answer
 
 
 MATH_SUFFIX = (
-    "\n\nReturn only the final answer as an integer, decimal, or fraction. "
-    "Do not include reasoning."
+    "\n\nAfter the required reasoning block, state the final answer clearly."
 )
 MCQA_SUFFIX = (
-    "\n\nAnswer with only the single letter of the correct option. "
-    "Do not include reasoning."
+    "\n\nAfter the required reasoning block, give the single letter of the "
+    "correct option."
 )
 CODE_OUTPUT_SUFFIX = (
-    "\n\nYou may include a long reasoning trace. End with a JSON object of the "
+    "\n\nAfter the required reasoning block, end with a JSON object of the "
     "form {\"output\": \"...\"} holding the exact predicted output string."
 )
 
@@ -45,7 +44,6 @@ REQUIRED_MCQA_OPTIONS = 10
 MCQA_LETTERS = tuple("ABCDEFGHIJ")
 
 _OPTION_LINE = re.compile(r"(?m)^[ \t]*([A-Z])(?:[:.]|\))[ \t]+")
-_NUMBERED_PART = re.compile(r"(?m)^[ \t]*\d+[.)][ \t]+")
 # OpenScienceReasoning-2 stores its answer bare in some row groups and
 # LaTeX-wrapped in others. Both encodings name the same option letter.
 _WRAPPED_LETTER = re.compile(
@@ -199,13 +197,6 @@ def _declared_option_letters(value: Any) -> set[str] | None:
     return set(letters)
 
 
-def _single_answer_question(text: str) -> bool:
-    """Conservatively reject prompts that visibly request multiple answers."""
-
-    question_marks = text.count("?") + text.count("？")
-    return question_marks <= 1 and len(_NUMBERED_PART.findall(text)) <= 1
-
-
 def _mcqa_row(
     *,
     row_id: str,
@@ -237,7 +228,7 @@ def _mcqa_row(
 def _math_row(
     *, row_id: str, question: str, answer: Any, source: str, license_id: str | None
 ) -> dict[str, Any] | None:
-    expected = canonical_numeric_answer(answer)
+    expected = canonical_math_answer(answer)
     if not expected or not question:
         return None
     return {
@@ -245,7 +236,7 @@ def _math_row(
         "task_type": "math",
         "prompt": question + MATH_SUFFIX,
         "expected": [expected],
-        "verifier": "strict_numeric",
+        "verifier": "math_exact",
         "source_dataset": source,
         "license": license_id,
     }
@@ -257,8 +248,8 @@ def _math_row(
 # --------------------------------------------------------------------------
 
 def normalize_open_math_reasoning(row: dict[str, Any], index: int) -> dict[str, Any] | None:
-    # Only rows whose answer the upstream pipeline actually extracted, and then
-    # only those whose answer is a complete number rather than an expression.
+    # Only rows whose answer the upstream pipeline actually extracted. Symbolic
+    # answers remain inert text and are compared exactly after normalization.
     if str(row.get("problem_type") or "") != "has_answer_extracted":
         return None
     problem = _clean_question(row.get("problem"))
@@ -276,10 +267,8 @@ def normalize_open_math_reasoning(row: dict[str, Any], index: int) -> dict[str, 
 def normalize_crossthink_math(row: dict[str, Any], index: int) -> dict[str, Any] | None:
     metadata = row.get("meta_data") if isinstance(row.get("meta_data"), dict) else {}
     reward = row.get("reward_model") if isinstance(row.get("reward_model"), dict) else {}
-    if str(reward.get("style") or "") != "rule":
-        return None
     question = _clean_question(metadata.get("question"))
-    if question is None or not _single_answer_question(question):
+    if question is None:
         return None
     return _math_row(
         row_id=f"math:crossthink:{metadata.get('index', index)}",
@@ -287,6 +276,23 @@ def normalize_crossthink_math(row: dict[str, Any], index: int) -> dict[str, Any]
         answer=reward.get("ground_truth"),
         source="nvidia/Nemotron-CrossThink",
         license_id="cc-by-4.0",
+    )
+
+
+def normalize_numina_math_1_5(row: dict[str, Any], index: int) -> dict[str, Any] | None:
+    # Numina uses proof/notfound sentinels when it has no final answer. All
+    # other answer-bearing rows are kept, including symbolic answers.
+    if str(row.get("question_type") or "").strip().lower() == "proof":
+        return None
+    problem = _clean_question(row.get("problem"))
+    if problem is None:
+        return None
+    return _math_row(
+        row_id=f"math:numina15:{_content_id(problem)}",
+        question=problem,
+        answer=row.get("answer"),
+        source="AI-MO/NuminaMath-1.5",
+        license_id="apache-2.0",
     )
 
 
@@ -355,6 +361,7 @@ Normalizer = Callable[[dict[str, Any], int], "dict[str, Any] | None"]
 NORMALIZERS: dict[str, Normalizer] = {
     "open_math_reasoning": normalize_open_math_reasoning,
     "crossthink_math": normalize_crossthink_math,
+    "numina_math_1_5": normalize_numina_math_1_5,
     "knowledge_mcqa": normalize_knowledge_mcqa,
     "open_science": normalize_open_science,
     "code_understanding": normalize_code_understanding,

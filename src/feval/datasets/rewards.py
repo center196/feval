@@ -166,6 +166,48 @@ def canonical_numeric_answer(value: Any) -> str | None:
     return str(parsed.numerator) if parsed.denominator == 1 else f"{parsed.numerator}/{parsed.denominator}"
 
 
+_NO_MATH_ANSWER = frozenset({"", "proof", "notfound", "none", "null", "nan"})
+
+
+def extract_math_answer(value: Any) -> str | None:
+    r"""Extract one inert final answer without evaluating its mathematics."""
+
+    text = ("" if value is None else str(value)).strip()
+    if not text:
+        return None
+    tagged = _last_answer_tag(text)
+    boxed = _last_balanced_boxed(text)
+    marked = _last_marker_candidate(text)
+    candidate = tagged if tagged is not None else boxed if boxed is not None else marked
+    return str(candidate if candidate is not None else text).strip() or None
+
+
+def canonical_math_answer(value: Any) -> str | None:
+    """Normalize presentation only, then preserve the answer text exactly.
+
+    This deliberately does not simplify fractions, evaluate expressions, call
+    SymPy, or infer mathematical equivalence. For example, ``1/2`` and ``0.5``
+    remain different answers.
+    """
+
+    extracted = extract_math_answer(value)
+    if extracted is None:
+        return None
+    text = _strip_math_wrappers(extracted)
+    if text.startswith(r"\boxed"):
+        boxed = _last_balanced_boxed(text)
+        if boxed is not None:
+            text = boxed
+            text = _strip_math_wrappers(text)
+    # Strip only whole-answer display wrappers. Inner LaTeX is inert text.
+    if text.startswith("\\[") and text.endswith("\\]"):
+        text = text[2:-2].strip()
+    text = re.sub(r"\s+", " ", text).strip()
+    if text.lower() in _NO_MATH_ANSWER:
+        return None
+    return text
+
+
 def _words(text: str) -> list[str]:
     return re.findall(r"[A-Za-z0-9]+(?:'[A-Za-z0-9]+)?", text)
 
@@ -458,12 +500,11 @@ def reward_answer(answer: Any, expected: Any, tolerance: float = 1e-6, verifier:
         return reward_json_output_exact(answer, expected_values)
     if verifier == "label_match":
         return int(any(normalize_answer(answer) == normalize_answer(value) for value in expected_values))
-    if verifier == "strict_numeric":
-        answer_number = strict_numeric_fraction(answer)
-        if answer_number is None:
+    if verifier == "math_exact":
+        answer_normalized = canonical_math_answer(answer)
+        if answer_normalized is None:
             return 0
-        answer_normalized = canonical_numeric_answer(answer_number)
-        expected_normalized = [canonical_numeric_answer(value) for value in expected_values]
+        expected_normalized = [canonical_math_answer(value) for value in expected_values]
         return int(any(answer_normalized == value for value in expected_normalized if value is not None))
     expected_number = next((numeric_value(value) for value in expected_values if numeric_value(value) is not None), None)
     answer_number = numeric_value(answer)

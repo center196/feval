@@ -27,6 +27,8 @@ from ..core.constants import (
     AUDIT_MAX_NUM_BATCHED_TOKENS,
     AUDIT_MAX_NUM_SEQS,
     DEFAULT_ROLLOUT_BATCH_SIZE,
+    REASONING_BUDGET_LEVELS,
+    REASONING_BUDGET_TOLERANCE_BPS,
 )
 from ..utils.jsonutil import load_jsonl, write_json
 
@@ -66,10 +68,71 @@ def configure_vllm_environment() -> None:
     os.environ["VLLM_BATCH_INVARIANT"] = "1"
 
 
-def fixed_prompt(prompt: str) -> str:
-    """The protocol-owned text template; miner repos cannot replace it."""
+def reasoning_budget_bounds(target: int) -> tuple[int, int]:
+    """Return the inclusive token-count range for one pinned reasoning level."""
 
-    return f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+    if target not in REASONING_BUDGET_LEVELS:
+        raise ValueError(f"unsupported reasoning budget {target!r}")
+    lower = (
+        target * (10_000 - REASONING_BUDGET_TOLERANCE_BPS) + 9_999
+    ) // 10_000
+    upper = target * (10_000 + REASONING_BUDGET_TOLERANCE_BPS) // 10_000
+    return lower, upper
+
+
+def fixed_prompt(prompt: str, reasoning_budget_tokens: int | None = None) -> str:
+    """The protocol-owned thinking template; miner repos cannot replace it."""
+
+    if reasoning_budget_tokens is None:
+        return f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+    lower, upper = reasoning_budget_bounds(reasoning_budget_tokens)
+    system = (
+        "Thinking mode is mandatory. Start your response exactly with <think>. "
+        f"Write about {reasoning_budget_tokens} tokenizer tokens of reasoning inside "
+        f"that block; {lower} through {upper} tokens inclusive are accepted. Close "
+        "the block with </think>. Only tokens between the opening and "
+        "first closing tag count toward this reasoning budget. After </think>, answer "
+        "the user's task normally; that final response is not part of the reasoning "
+        "budget. /think"
+    )
+    return (
+        f"<|im_start|>system\n{system}<|im_end|>\n"
+        f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+    )
+
+
+def _subsequence_index(values: list[int], pattern: list[int], start: int = 0) -> int:
+    if not pattern:
+        raise ValueError("reasoning marker must tokenize to at least one token")
+    last = len(values) - len(pattern)
+    for index in range(start, last + 1):
+        if values[index : index + len(pattern)] == pattern:
+            return index
+    return -1
+
+
+def split_reasoning_tokens(
+    tokenizer: Any,
+    tokens: list[int],
+    reasoning_budget_tokens: int,
+) -> tuple[list[int], list[int]]:
+    """Validate one thinking block and return its payload and post-think answer."""
+
+    lower, upper = reasoning_budget_bounds(reasoning_budget_tokens)
+    opening = [int(value) for value in tokenizer.encode("<think>", add_special_tokens=False)]
+    closing = [int(value) for value in tokenizer.encode("</think>", add_special_tokens=False)]
+    if tokens[: len(opening)] != opening:
+        raise ValueError("response must start exactly with <think>")
+    closing_at = _subsequence_index(tokens, closing, len(opening))
+    if closing_at < 0:
+        raise ValueError("response is missing </think>")
+    reasoning = list(tokens[len(opening) : closing_at])
+    if not lower <= len(reasoning) <= upper:
+        raise ValueError(
+            f"reasoning block has {len(reasoning)} tokens; expected {lower} through {upper}"
+        )
+    answer = list(tokens[closing_at + len(closing) :])
+    return reasoning, answer
 
 
 def load_protocol_tokenizer(config: NetworkConfig):
@@ -386,7 +449,10 @@ def rollout_context_limit(
     output_limit = rollout_output_limit(config, max_output_tokens)
     max_prompt_tokens = 0
     for row in rows:
-        prompt_ids = tokenizer.encode(fixed_prompt(str(row["prompt"])), add_special_tokens=False)
+        prompt_ids = tokenizer.encode(
+            fixed_prompt(str(row["prompt"]), int(row["reasoning_budget_tokens"])),
+            add_special_tokens=False,
+        )
         max_prompt_tokens = max(max_prompt_tokens, len(prompt_ids))
     if max_prompt_tokens >= config.max_context_tokens:
         raise ValueError(
@@ -406,6 +472,7 @@ def protocol_rollout_tokens(
     prompt: str,
     tokens: list[int],
     *,
+    reasoning_budget_tokens: int,
     max_output_tokens: int | None = None,
 ) -> tuple[list[int], list[int]]:
     """Return the single protocol-defined rollout prefix used everywhere.
@@ -415,7 +482,10 @@ def protocol_rollout_tokens(
     Per-row miner-provided stop or length metadata is deliberately irrelevant.
     """
 
-    prompt_ids = tokenizer.encode(fixed_prompt(prompt), add_special_tokens=False)
+    prompt_ids = tokenizer.encode(
+        fixed_prompt(prompt, reasoning_budget_tokens),
+        add_special_tokens=False,
+    )
     output_limit = rollout_output_limit(config, max_output_tokens)
     available = min(output_limit, config.max_context_tokens - len(prompt_ids))
     if available <= 0:
@@ -524,7 +594,10 @@ def generate_rollouts_vllm(
         prompts = [
             {
                 "prompt_token_ids": tokenizer.encode(
-                    fixed_prompt(str(row["prompt"])),
+                    fixed_prompt(
+                        str(row["prompt"]),
+                        int(row["reasoning_budget_tokens"]),
+                    ),
                     add_special_tokens=False,
                 )
             }
@@ -539,6 +612,18 @@ def generate_rollouts_vllm(
         ]
         if any(value <= 0 for value in request_max_tokens):
             raise ValueError("a rollout prompt leaves no room for generation under the context limit")
+        marker_tokens = len(tokenizer.encode("<think>", add_special_tokens=False)) + len(
+            tokenizer.encode("</think>", add_special_tokens=False)
+        )
+        for row, available in zip(rows, request_max_tokens):
+            target = int(row["reasoning_budget_tokens"])
+            # Reserve one post-think token as well. The answer has no separate
+            # length target, but a row must at least be capable of answering.
+            if available < target + marker_tokens + 1:
+                raise ValueError(
+                    f"rollout {row['row_id']!r} has only {available} output tokens "
+                    f"available for its {target}-token reasoning target"
+                )
         params = [
             SamplingParams(
                 temperature=0.0,
@@ -787,6 +872,7 @@ class VllmAuditEngine:
                 self.tokenizer,
                 str(row["prompt"]),
                 list(row["tokens"]),
+                reasoning_budget_tokens=int(row["reasoning_budget_tokens"]),
                 max_output_tokens=max_output_tokens,
             )
             if not response_ids:

@@ -33,6 +33,21 @@ JSONL_BLOCK_BYTES = 1 << 20
 # Refuse absurd footers so a malformed or hostile revision cannot fan out.
 MAX_FILES_PER_SOURCE = 512
 MAX_ROW_GROUPS_PER_FILE = 4096
+# Even a quota failure must not fall back to scanning an entire source. At
+# most 90% of its independently addressable storage blocks are eligible in a
+# window. A one-block file is unavoidable, but Parquet still range-reads only
+# the requested column chunks from that block.
+MAX_SOURCE_SCAN_BPS = 9_000
+
+
+def partial_block_count(total: int) -> int:
+    """Bound a window below a full-source block scan whenever possible."""
+
+    if total <= 0:
+        raise ValueError("source block count must be positive")
+    if total == 1:
+        return 1
+    return min(total - 1, max(1, total * MAX_SOURCE_SCAN_BPS // 10_000))
 
 
 @dataclass(frozen=True)
@@ -125,6 +140,9 @@ def iter_parquet_blocks(
         raise ValueError(f"source {source.name} has an unusable file list")
     filesystem = _filesystem(token)
     shards = seeded_order(list(source.files), seed=seed, name=source.name, kind="shard")
+    # Cap the shard list as well as each shard's row groups. This matters for
+    # sources whose Parquet shards each contain only one row group.
+    shards = shards[:partial_block_count(len(shards))]
     emitted = 0
     for filename in shards:
         path = _hf_path(source, filename)
@@ -138,7 +156,7 @@ def iter_parquet_blocks(
                 seed=seed,
                 name=source.name,
                 kind=f"row_group:{filename}",
-            )
+            )[:partial_block_count(total_groups)]
             for index in order:
                 rows = parquet.read_row_group(index, columns=list(source.columns)).to_pylist()
                 emitted += len(rows)
@@ -179,6 +197,7 @@ def iter_jsonl_blocks(
         blocks = max(1, (size + JSONL_BLOCK_BYTES - 1) // JSONL_BLOCK_BYTES)
         targets.extend([path, index] for index in range(blocks))
     targets = seeded_order(targets, seed=seed, name=source.name, kind="byte_block")
+    targets = targets[:partial_block_count(len(targets))]
     emitted = 0
     handles: dict[str, Any] = {}
     try:

@@ -12,13 +12,14 @@ the ones published on each dataset page.
 
 | Source | Revision | Licence | Rows per window |
 | --- | --- | --- | --- |
-| [nvidia/OpenMathReasoning](https://huggingface.co/datasets/nvidia/OpenMathReasoning) | `d3d08664755704f422af97d43a7ff0ded4bd95df` | CC BY 4.0 | 3,000 |
-| [nvidia/Nemotron-CrossThink](https://huggingface.co/datasets/nvidia/Nemotron-CrossThink) | `a4ce9a3b9434c5f231e2cbe30696d9a721c11d69` | CC BY 4.0 | 1,500 |
-| [nvidia/Nemotron-RL-knowledge-mcqa](https://huggingface.co/datasets/nvidia/Nemotron-RL-knowledge-mcqa) | `62a1eec1f952723eab2ee3832222f533b8138067` | CC BY 4.0 | 2,000 |
-| [nvidia/OpenScienceReasoning-2](https://huggingface.co/datasets/nvidia/OpenScienceReasoning-2) | `174b02c9cdf231f220765b2a1d5ece4550921894` | CC BY 4.0 | 1,500 |
-| [PrimeIntellect/synthetic-code-understanding](https://huggingface.co/datasets/PrimeIntellect/synthetic-code-understanding) | `106a1cec075ae29b8dc07e355a29ddce2cf0745b` | Apache-2.0, see note | 2,000 |
+| [nvidia/OpenMathReasoning](https://huggingface.co/datasets/nvidia/OpenMathReasoning) | `d3d08664755704f422af97d43a7ff0ded4bd95df` | CC BY 4.0 | 56,382 |
+| [nvidia/Nemotron-CrossThink](https://huggingface.co/datasets/nvidia/Nemotron-CrossThink) | `a4ce9a3b9434c5f231e2cbe30696d9a721c11d69` | CC BY 4.0 | 1,759 |
+| [AI-MO/NuminaMath-1.5](https://huggingface.co/datasets/AI-MO/NuminaMath-1.5) | `1b05109f9e5c1ad06c0663519502416c30b300f8` | Apache-2.0 | 15,785 |
+| [nvidia/Nemotron-RL-knowledge-mcqa](https://huggingface.co/datasets/nvidia/Nemotron-RL-knowledge-mcqa) | `62a1eec1f952723eab2ee3832222f533b8138067` | CC BY 4.0 | 10,868 |
+| [nvidia/OpenScienceReasoning-2](https://huggingface.co/datasets/nvidia/OpenScienceReasoning-2) | `174b02c9cdf231f220765b2a1d5ece4550921894` | CC BY 4.0 | 14,138 |
+| [PrimeIntellect/synthetic-code-understanding](https://huggingface.co/datasets/PrimeIntellect/synthetic-code-understanding) | `106a1cec075ae29b8dc07e355a29ddce2cf0745b` | Apache-2.0, see note | 1,068 |
 
-All five are published for commercial use.
+All six are published for commercial use.
 
 ### Attribution
 
@@ -30,6 +31,9 @@ All five are published for commercial use.
   [Qwen Licence Agreement](https://huggingface.co/Qwen/Qwen2.5-72B-Instruct/blob/main/LICENSE).
 - **Nemotron-RL-knowledge-mcqa** combines and refines subsets of
   OpenScienceReasoning-2 together with other unstructured sources.
+- **NuminaMath-1.5** is published by Project Numina under Apache-2.0. Feval
+  reads only its problem, answer, and question type; its
+  long solution traces are not transferred.
 
 ### Note on `PrimeIntellect/synthetic-code-understanding`
 

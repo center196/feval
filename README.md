@@ -33,14 +33,13 @@ Set `HF_TOKEN` on miner hosts that upload to Hugging Face. Validators do not
 need a Hugging Face token when model and rollout repositories are public.
 Never commit `.env`, wallet files, private keys, tokens, or validator state.
 
-Each two-day window draws its 10,000 rows from five pinned public Hugging Face
-datasets. Sources are never downloaded whole: parquet footers give a row-group
-map for free, and the window seed picks which row groups (or, for a JSONL
+Each twelve-hour window draws 100,000 rows from six pinned public Hugging Face
+datasets whose raw candidate union contains well over one million rows. Sources
+are never downloaded whole: parquet footers give a row-group map for free, and
+a seed revealed at the window boundary picks which row groups (or, for a JSONL
 source, which byte blocks) to read, fetching only the columns Feval grades on.
-Building a window transfers a few hundred megabytes rather than tens of
-gigabytes, and takes roughly a minute and a half. The first cycle for a window
-reports per-source scan progress; the unauthenticated-request warning is
-harmless for public repositories.
+The first cycle for a window reports per-source scan progress; the
+unauthenticated-request warning is harmless for public repositories.
 
 ## Repository layout
 
@@ -157,28 +156,53 @@ Check liveness with `feval health --state validator-state.json`. See
 
 ## Evaluation protocol
 
-Every 14,400 finalized blocks (approximately two days), miners and validators
-derive the same 10,000-row evaluation set from immutable, code-pinned dataset
-revisions. Every row is settled by deterministic normalization followed by
-exact equality. There is no model judge, no symbolic algebra, and no execution
-of dataset or model code anywhere in the grading path.
+Every 3,600 finalized blocks (approximately twelve hours), miners and validators
+derive the same 100,000-row evaluation set from immutable, code-pinned dataset
+revisions. A model must be committed before the first block of the window. The
+hash of that finalized boundary block reveals the evaluation seed, so a miner
+cannot know the exact next sample before committing its model.
 
-| Source | Rows | Verifier |
-| --- | --- | --- |
-| nvidia/OpenMathReasoning | 3,000 | `strict_numeric` |
-| nvidia/Nemotron-CrossThink | 1,500 | `strict_numeric` |
-| nvidia/Nemotron-RL-knowledge-mcqa | 2,000 | `mcqa_letter` |
-| nvidia/OpenScienceReasoning-2 | 1,500 | `mcqa_letter` |
-| PrimeIntellect/synthetic-code-understanding | 2,000 | `json_output_exact` |
+The per-window source mixture is deterministic and has no manually maintained
+category ratio. Rows are allocated by largest remainder in direct proportion
+to the pinned size of each selected source split:
+
+| Source | Pinned source rows | Rows per window |
+| --- | ---: | ---: |
+| OpenMathReasoning `cot` | 3,201,061 | 56,382 |
+| Nemotron-CrossThink Math | 99,880 | 1,759 |
+| NuminaMath-1.5 `train` | 896,215 | 15,785 |
+| Nemotron-RL-knowledge-mcqa `train` | 617,020 | 10,868 |
+| OpenScienceReasoning-2 | 802,666 | 14,138 |
+| synthetic-code-understanding | 60,621 | 1,068 |
+
+The protocol pins the Hub viewer's 802,666-row OpenScience estimate because its
+single original Parquet file is only partially indexed by that viewer.
+Obtaining post-normalization usable counts would require scanning every source,
+which the runtime deliberately does not do. A window fails closed if seeded
+partial reads cannot fill any derived quota. Even on failure, the reader is
+limited to 90% of a source's independently addressable row groups or byte
+blocks (a one-block file is the unavoidable minimum). Every selected row has
+equal score weight and is settled by deterministic normalization followed by
+exact equality. There is no model judge, no symbolic
+algebra, and no execution of dataset or model code anywhere in the grading
+path.
+
+Rows may recur across independently sampled windows. Feval deliberately treats
+the public corpus as trainable: the boundary seed hides the exact next mixture,
+not the source data. A strict 180-day no-reuse rule would require 36 million
+distinct eligible rows at two 100,000-row windows per day, which the currently
+verified pool cannot support.
 
 The three verifiers are:
 
-- `strict_numeric` statically extracts a final integer, decimal, or simple
-  fraction from a complete numeric response, the last balanced `\boxed{...}`,
+- `math_exact` statically extracts the final answer from a complete response,
+  the last balanced `\boxed{...}`,
   an `<answer>...</answer>` body, or an `Answer`/`Final answer` marker. Both
-  sides are reduced to a canonical rational string and compared exactly.
-  Arbitrary last-number guessing, expressions, variables, symbolic algebra,
-  and approximate comparisons are rejected.
+  sides receive presentation-only whitespace and outer-wrapper normalization,
+  then are compared exactly. Answer-bearing symbolic expressions, variables,
+  and multiple-value answers remain eligible. Nothing is simplified or
+  evaluated: `0.5` differs from `1/2`, and `x+y` differs from `y+x`. Proof and
+  missing-answer rows are excluded.
 - `mcqa_letter` compares one option letter. Only ten-option questions are kept,
   and Knowledge-MCQA's declared option keys must agree with the options rendered
   in the prompt. Static local parsing accepts the source layouts `A:`, `A.`, and
@@ -190,15 +214,13 @@ The three verifiers are:
   whitespace. Reasoning and program text remain inert and are never run; the
   expected output ships with the pinned revision.
 
-6,500 of the 10,000 rows use a verifier where guessing is worthless, and the
-protocol refuses to build a window that falls below that floor. A miner that
-answers every row with the single most common option letter scores about 6%.
+Each row contributes equally to the overall exact-match score. Per-source and
+per-category counts and scores are retained as diagnostics, but there is no
+manual category weighting or category score floor.
 
 Each source keeps its own answer conventions out of the prompt: Feval extracts
 the bare question, supplies its own output instruction, and drops any row whose
-text still carries a competing format instruction. CrossThink rows that visibly
-request multiple answers are also dropped because one scalar ground-truth field
-cannot grade them unambiguously. Dataset text and metadata are handled only as
+text still carries a competing format instruction. Dataset text and metadata are handled only as
 bounded data: they are never evaluated, compiled, imported, or executed.
 
 Production commands cannot replace those datasets or reduce the row count.
@@ -206,28 +228,43 @@ Miners select `--max-new-tokens` from 1 through 32,768; validators read the
 rollout manifest and enforce that exact requested limit. Prompt plus response
 is always capped at 32,768 tokens, so the effective generation budget for each
 row is the smaller of the miner's choice and the context remaining after its
-fixed prompt. A 256 MiB total bundle cap prevents miners from imposing
-multi-gigabyte downloads. Dataset, verifier, and context changes are manual
+fixed prompt.
+
+The future boundary seed independently assigns each row one of five reasoning
+levels: 1,024, 2,048, 4,096, 8,192, or 16,384 tokenizer tokens. The shared
+system prompt requires one response-leading `<think>...</think>` block. Only
+tokens inside that first block count, and ±10% of the assigned level is valid.
+Text after `</think>` has no separate length target and is the only text passed
+to the answer verifier. Missing, malformed, or out-of-range reasoning blocks
+score zero. Miners generate with this prompt; validators reconstruct the same
+prompt, recount with the pinned tokenizer, and teacher-force the complete
+rollout during audits. The rollout bundle is capped at 8 GiB because mandatory
+long reasoning makes the former 256 MiB ceiling impossible.
+
+Dataset, verifier, and context changes are manual
 protocol upgrades; `sources_digest` in the network config pins every repository,
-revision, file, column, verifier, and row quota as one value. Validators score
-all rows locally, then verify unpredictable samples drawn only from correctly
-answered rows against the committed adapter using bounded
-greedy-token checks. Every token must be within the top three and a 0.25
-logprob gap, while at least 99.5% must be exact rank one. Eligibility normally
-requires 10 successful rounds of 32 distinct correct rows; smaller correct
-populations are fully covered sooner, and auditing continues for up to 20 rounds.
+revision, file, column, verifier, category, and selected-split size as one
+value. Validators calculate one exact-match average across all rows and also
+publish per-category diagnostics. They then verify unpredictable samples drawn only
+from correctly answered rows against the committed adapter using bounded
+greedy-token checks. Audit sampling is uniform across the remaining correctly
+answered rows. Every token must be within the top three and a 0.25 logprob gap, while
+at least 99.5% must be exact rank one. Eligibility normally requires 30
+successful rounds of 32 distinct correct rows (960 rows total), which detects a
+1% forged correct-row population with greater than 99.99% probability. After
+every participating miner has either reached 30 rounds or terminated, valid
+miners are re-audited until 50 successful rounds. Smaller correct populations
+are fully covered sooner.
 Validators consider only currently registered miners with valid Feval
 metadata. Exact model and exact full-rollout copies belong to the earlier
 current commitment block, with the hotkey as a deterministic same-block tie
 breaker. Replacing a commitment or leaving the current miner set removes its
 priority.
 
-The math checker is deliberately narrower than a full symbolic grader: after
-static final-answer extraction, it accepts only simple numeric literals. This
-drops most symbolic rows in the source datasets. That is the intended trade. It
-keeps validation
-deterministic across GPUs and runtimes, inexpensive, and free of dataset code
-execution, and it means two validators can never disagree about a score. See
+The math checker is deliberately an exact matcher rather than a symbolic
+grader. It retains any answer-bearing math row but does not determine whether
+two different expressions are mathematically equivalent. This keeps validation
+deterministic across GPUs and runtimes and free of dataset code execution. See
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for dataset licences and
 attribution obligations.
 
